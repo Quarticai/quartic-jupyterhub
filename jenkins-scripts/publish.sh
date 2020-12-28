@@ -14,5 +14,15 @@ make build
 
 NAME=quartic_jupyterhub
 VERSION=$(awk '$1 == "__version__" {print $NF}' ./jupyterhub/_version.py | sed "s/'//g")
+OS=none
+CPU_ARCH=any
 
-bash ./jenkins-scripts/publish_package.sh "$NAME" "$VERSION"
+WHEEL_FILENAME="$NAME-$VERSION-py3-$OS-$CPU_ARCH.whl"
+CODE=$(curl -sS -w '%{http_code}' -F package="@dist/$WHEEL_FILENAME" -o output.txt "https://$GEMFURY_AUTH_TOKEN@push.fury.io/quartic-ai/")
+cat output.txt && rm -rf output.txt
+if [[ "$CODE" =~ ^2 ]]; then
+    echo "$WHEEL_FILENAME Package published successfully"
+else
+    echo "ERROR: server returned HTTP code $CODE"
+    exit 1
+fi
