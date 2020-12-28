@@ -516,11 +516,7 @@ class BaseHandler(RequestHandler):
         kwargs.update(self.settings.get('cookie_options', {}))
         kwargs.update(overrides)
 
-        if encrypted:
-            set_cookie = self.set_secure_cookie
-        else:
-            set_cookie = self.set_cookie
-
+        set_cookie = self.set_secure_cookie if encrypted else self.set_cookie
         self.log.debug("Setting cookie %s: %s", key, kwargs)
         set_cookie(key, value, **kwargs)
 
@@ -640,11 +636,7 @@ class BaseHandler(RequestHandler):
             )
 
         # this is where we know if next_url is coming from ?next= param or we are using a default url
-        if next_url:
-            next_url_from_param = True
-        else:
-            next_url_from_param = False
-
+        next_url_from_param = bool(next_url)
         if not next_url:
             # custom default URL, usually passed because user landed on that page but was not logged in
             if default:
@@ -1179,10 +1171,7 @@ class BaseHandler(RequestHandler):
 
         If sync is False, we return a Template that is compiled with async support
         """
-        if sync:
-            key = 'jinja2_env_sync'
-        else:
-            key = 'jinja2_env'
+        key = 'jinja2_env_sync' if sync else 'jinja2_env'
         return self.settings[key].get_template(name)
 
     def render_template(self, name, sync=False, **ns):
