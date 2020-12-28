@@ -9,7 +9,7 @@ help:
 	@echo "quartic-jupyterhub Makefile Help:\n"\
 	"clean:  Remove all cache and wheel packages.\n"\
 	"build:  Build quartic_jupyterhub wheel package via setup.py.\n"\
-	"version:  Show current deming-core version.\n"\
+	"version:  Show current quartic_jupyterhub version.\n"\
 	"publish:  Upload the package in dist directory that matches current quartic_jupyterhub version.\n"\
 	" VERSION Specify another version to upload (If there is one available). "
 
