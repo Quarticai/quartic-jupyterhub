@@ -33,9 +33,11 @@ class LogoutHandler(BaseHandler):
         ]
         if active_servers:
             self.log.info("Shutting down %s's servers", user.name)
-            futures = []
-            for server_name in active_servers:
-                futures.append(maybe_future(self.stop_single_user(user, server_name)))
+            futures = [
+                maybe_future(self.stop_single_user(user, server_name))
+                for server_name in active_servers
+            ]
+
             await asyncio.gather(*futures)
 
     def _backend_logout_cleanup(self, name):
@@ -138,9 +140,10 @@ class LoginHandler(BaseHandler):
 
     async def post(self):
         # parse the arguments dict
-        data = {}
-        for arg in self.request.arguments:
-            data[arg] = self.get_argument(arg, strip=False)
+        data = {
+            arg: self.get_argument(arg, strip=False)
+            for arg in self.request.arguments
+        }
 
         auth_timer = self.statsd.timer('login.authenticate').start()
         user = await self.login_user(data)
