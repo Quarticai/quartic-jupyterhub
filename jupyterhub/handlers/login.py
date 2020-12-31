@@ -2,7 +2,7 @@
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 import asyncio
-
+import os
 from tornado import web
 from tornado.escape import url_escape
 from tornado.httputil import url_concat
@@ -10,6 +10,9 @@ from tornado.httputil import url_concat
 from ..utils import maybe_future
 from .base import BaseHandler
 
+SERVER_NAME = os.environ.get('SERVER_NAME', 'localhost:8000')
+SITE_URL = 'https://' + SERVER_NAME if 'localhost:8000' not in SERVER_NAME else 'http://' + SERVER_NAME
+LOGIN_URL = SITE_URL + '/accounts/login'
 
 class LogoutHandler(BaseHandler):
     """Log a user out by clearing their login cookie."""
@@ -131,8 +134,7 @@ class LoginHandler(BaseHandler):
                         )
                     self.redirect(auto_login_url)
                 return
-            username = self.get_argument('username', default='')
-            self.finish(await self._render(username=username))
+            self.redirect(f'{LOGIN_URL}?next=/jupyterhub')
 
     async def post(self):
         # parse the arguments dict
