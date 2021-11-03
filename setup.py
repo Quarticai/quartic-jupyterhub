@@ -63,11 +63,6 @@ def get_package_data():
     return package_data
 
 
-ns = {}
-with open(pjoin(here, 'jupyterhub', '_version.py')) as f:
-    exec(f.read(), {}, ns)
-
-
 packages = []
 for d, _, _ in os.walk('jupyterhub'):
     if os.path.exists(pjoin(d, '__init__.py')):
@@ -84,7 +79,6 @@ setup_args = dict(
     # this will be overridden when bower is run anyway
     data_files=get_data_files() or ['dummy'],
     package_data=get_package_data(),
-    version=ns['__version__'],
     description="JupyterHub: A multi-user server for Jupyter notebooks",
     long_description=readme,
     long_description_content_type='text/markdown',
