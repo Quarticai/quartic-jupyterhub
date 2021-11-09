@@ -45,12 +45,12 @@ is_repo = os.path.exists(pjoin(here, '.git'))
 def get_data_files():
     """Get data files in share/jupyter"""
 
-    data_files = []
     ntrim = len(here + os.path.sep)
 
-    for (d, dirs, filenames) in os.walk(share_jupyterhub):
-        data_files.append((d[ntrim:], [pjoin(d, f) for f in filenames]))
-    return data_files
+    return [
+        (d[ntrim:], [pjoin(d, f) for f in filenames])
+        for (d, dirs, filenames) in os.walk(share_jupyterhub)
+    ]
 
 
 def get_package_data():
@@ -58,20 +58,14 @@ def get_package_data():
 
     (mostly alembic config)
     """
-    package_data = {}
-    package_data['jupyterhub'] = ['alembic.ini', 'alembic/*', 'alembic/versions/*']
-    return package_data
+    return {'jupyterhub': ['alembic.ini', 'alembic/*', 'alembic/versions/*']}
 
 
-ns = {}
-with open(pjoin(here, 'jupyterhub', '_version.py')) as f:
-    exec(f.read(), {}, ns)
-
-
-packages = []
-for d, _, _ in os.walk('jupyterhub'):
-    if os.path.exists(pjoin(d, '__init__.py')):
-        packages.append(d.replace(os.path.sep, '.'))
+packages = [
+    d.replace(os.path.sep, '.')
+    for d, _, _ in os.walk('jupyterhub')
+    if os.path.exists(pjoin(d, '__init__.py'))
+]
 
 with open('README.md', encoding="utf8") as f:
     readme = f.read()
@@ -84,7 +78,6 @@ setup_args = dict(
     # this will be overridden when bower is run anyway
     data_files=get_data_files() or ['dummy'],
     package_data=get_package_data(),
-    version=ns['__version__'],
     description="JupyterHub: A multi-user server for Jupyter notebooks",
     long_description=readme,
     long_description_content_type='text/markdown',
@@ -270,8 +263,6 @@ def js_css_first(cls, strict=True):
             except Exception:
                 if strict:
                     raise
-                else:
-                    pass
             return super().run()
 
     return Command
