@@ -20,7 +20,7 @@ Other components
 - MockPAMAuthenticator
 - MockHub
 - MockSingleUserServer
-- StubSingleUserSpawner
+- InstrumentedSpawner
 
 - public_host
 - public_url
@@ -29,32 +29,21 @@ Other components
 import asyncio
 import os
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from tempfile import NamedTemporaryFile
 from unittest import mock
 from urllib.parse import urlparse
 
 from pamela import PAMError
-from tornado.ioloop import IOLoop
-from traitlets import Bool
-from traitlets import default
-from traitlets import Dict
+from tornado.httputil import url_concat
+from traitlets import Bool, Dict, default
 
-from .. import metrics
-from .. import orm
+from .. import metrics, orm, roles
 from ..app import JupyterHub
 from ..auth import PAMAuthenticator
-from ..objects import Server
-from ..singleuser import SingleUserNotebookApp
-from ..spawner import LocalProcessSpawner
 from ..spawner import SimpleLocalProcessSpawner
-from ..utils import random_port
-from ..utils import url_path_join
-from .utils import async_requests
-from .utils import public_host
-from .utils import public_url
-from .utils import ssl_setup
+from ..utils import random_port, utcnow
+from .utils import async_requests, public_url, ssl_setup
 
 
 def mock_authenticate(username, password, service, encoding):
@@ -96,6 +85,11 @@ class MockSpawner(SimpleLocalProcessSpawner):
     use_this_api_token = None
 
     def start(self):
+        # preserve any JupyterHub env in mock spawner
+        for key in os.environ:
+            if 'JUPYTERHUB' in key and key not in self.env_keep:
+                self.env_keep.append(key)
+
         if self.use_this_api_token:
             self.api_token = self.use_this_api_token
         elif self.will_resume:
@@ -106,7 +100,7 @@ class MockSpawner(SimpleLocalProcessSpawner):
 class SlowSpawner(MockSpawner):
     """A spawner that takes a few seconds to start"""
 
-    delay = 2
+    delay = 5
     _start_future = None
 
     async def start(self):
@@ -218,9 +212,7 @@ class MockPAMAuthenticator(PAMAuthenticator):
             close_session=mock_open_session,
             check_account=mock_check_account,
         ):
-            username = await super(MockPAMAuthenticator, self).authenticate(
-                *args, **kwargs
-            )
+            username = await super().authenticate(*args, **kwargs)
         if username is None:
             return
         elif self.auth_state:
@@ -305,13 +297,15 @@ class MockHub(JupyterHub):
     test_clean_db = Bool(True)
 
     def init_db(self):
-        """Ensure we start with a clean user list"""
+        """Ensure we start with a clean user & role list"""
         super().init_db()
         if self.test_clean_db:
             for user in self.db.query(orm.User):
                 self.db.delete(user)
             for group in self.db.query(orm.Group):
                 self.db.delete(group)
+            for role in self.db.query(orm.Role):
+                self.db.delete(role)
             self.db.commit()
 
     async def initialize(self, argv=None):
@@ -326,30 +320,36 @@ class MockHub(JupyterHub):
         user = self.db.query(orm.User).filter(orm.User.name == 'user').first()
         if user is None:
             user = orm.User(name='user')
+            # avoid initial state inconsistency by setting initial activity
+            user.last_activity = utcnow()
             self.db.add(user)
             self.db.commit()
             metrics.TOTAL_USERS.inc()
+        roles.assign_default_roles(self.db, entity=user)
+        self.db.commit()
+
+    _stop_called = False
 
     def stop(self):
-        super().stop()
-
+        if self._stop_called:
+            return
+        self._stop_called = True
         # run cleanup in a background thread
         # to avoid multiple eventloops in the same thread errors from asyncio
 
         def cleanup():
-            asyncio.set_event_loop(asyncio.new_event_loop())
-            loop = IOLoop.current()
-            loop.run_sync(self.cleanup)
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(self.cleanup())
             loop.close()
 
-        pool = ThreadPoolExecutor(1)
-        f = pool.submit(cleanup)
-        # wait for cleanup to finish
-        f.result()
-        pool.shutdown()
+        with ThreadPoolExecutor(1) as pool:
+            f = pool.submit(cleanup)
+            # wait for cleanup to finish
+            f.result()
 
-        # ignore the call that will fire in atexit
-        self.cleanup = lambda: None
+        # prevent redundant atexit from running
+        self._atexit_ran = True
+        super().stop()
         self.db_file.close()
 
     async def login_user(self, name):
@@ -358,34 +358,34 @@ class MockHub(JupyterHub):
         external_ca = None
         if self.internal_ssl:
             external_ca = self.external_certs['files']['ca']
+        login_url = base_url + 'hub/login'
+        r = await async_requests.get(login_url)
+        r.raise_for_status()
+        xsrf = r.cookies['_xsrf']
+
         r = await async_requests.post(
-            base_url + 'hub/login',
+            url_concat(login_url, {"_xsrf": xsrf}),
+            cookies=r.cookies,
             data={'username': name, 'password': name},
             allow_redirects=False,
             verify=external_ca,
         )
         r.raise_for_status()
-        assert r.cookies
+        r.cookies["_xsrf"] = xsrf
+        assert sorted(r.cookies.keys()) == [
+            '_xsrf',
+            'jupyterhub-hub-login',
+            'jupyterhub-session-id',
+        ]
         return r.cookies
 
 
-# single-user-server mocking:
-
-
-class MockSingleUserServer(SingleUserNotebookApp):
-    """Mock-out problematic parts of single-user server when run in a thread
-
-    Currently:
-
-    - disable signal handler
+class InstrumentedSpawner(MockSpawner):
     """
+    Spawner that starts a full singleuser server
 
-    def init_signal(self):
-        pass
-
-
-class StubSingleUserSpawner(MockSpawner):
-    """Spawner that starts a MockSingleUserServer in a thread."""
+    instrumented with the JupyterHub test extension.
+    """
 
     @default("default_url")
     def _default_url(self):
@@ -394,48 +394,15 @@ class StubSingleUserSpawner(MockSpawner):
         Should be:
 
         - authenticated, so we are testing auth
-        - always available (i.e. in base ServerApp and NotebookApp
+        - always available (i.e. in mocked ServerApp and NotebookApp)
+        - *not* an API handler that raises 403 instead of redirecting
         """
-        return "/api/status"
+        return "/tree"
 
-    _thread = None
+    @default('cmd')
+    def _cmd_default(self):
+        return [sys.executable, '-m', 'jupyterhub.singleuser']
 
-    async def start(self):
-        ip = self.ip = '127.0.0.1'
-        port = self.port = random_port()
-        env = self.get_env()
-        args = self.get_args()
-        evt = threading.Event()
-        print(args, env)
-
-        def _run():
-            asyncio.set_event_loop(asyncio.new_event_loop())
-            io_loop = IOLoop()
-            io_loop.make_current()
-            io_loop.add_callback(lambda: evt.set())
-
-            with mock.patch.dict(os.environ, env):
-                app = self._app = MockSingleUserServer()
-                app.initialize(args)
-                assert app.hub_auth.oauth_client_id
-                assert app.hub_auth.api_token
-                app.start()
-
-        self._thread = threading.Thread(target=_run)
-        self._thread.start()
-        ready = evt.wait(timeout=3)
-        assert ready
-        return (ip, port)
-
-    async def stop(self):
-        self._app.stop()
-        self._thread.join(timeout=30)
-        assert not self._thread.is_alive()
-
-    async def poll(self):
-        if self._thread is None:
-            return 0
-        if self._thread.is_alive():
-            return None
-        else:
-            return 0
+    def start(self):
+        self.environment["JUPYTERHUB_SINGLEUSER_TEST_EXTENSION"] = "1"
+        return super().start()

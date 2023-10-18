@@ -2,16 +2,15 @@
 # Copyright (c) IPython Development Team.
 # Distributed under the terms of the Modified BSD License.
 import inspect
-import pipes
 import re
+import shlex
 import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from shutil import which
-from subprocess import PIPE
-from subprocess import Popen
-from subprocess import STDOUT
+from subprocess import PIPE, STDOUT, Popen
+from textwrap import dedent
 
 try:
     import pamela
@@ -20,19 +19,35 @@ except Exception as e:
     _pamela_error = e
 
 from tornado.concurrent import run_on_executor
-
+from traitlets import Any, Bool, Dict, Integer, Set, Unicode, default, observe
 from traitlets.config import LoggingConfigurable
-from traitlets import Bool, Integer, Set, Unicode, Dict, Any, default, observe
 
 from .handlers.login import LoginHandler
-from .utils import maybe_future, url_path_join
 from .traitlets import Command
+from .utils import maybe_future, url_path_join
 
 
 class Authenticator(LoggingConfigurable):
     """Base class for implementing an authentication provider for JupyterHub"""
 
     db = Any()
+
+    @default("db")
+    def _deprecated_db(self):
+        self.log.warning(
+            dedent(
+                """
+                The shared database session at Authenticator.db is deprecated, and will be removed.
+                Please manage your own database and connections.
+
+                Contact JupyterHub at https://github.com/jupyterhub/jupyterhub/issues/3700
+                if you have questions or ideas about direct database needs for your Authenticator.
+                """
+            ),
+        )
+        return self._deprecated_db_session
+
+    _deprecated_db_session = Any()
 
     enable_auth_state = Bool(
         False,
@@ -88,6 +103,10 @@ class Authenticator(LoggingConfigurable):
         help="""
         Set of users that will have admin rights on this JupyterHub.
 
+        Note: As of JupyterHub 2.0,
+        full admin rights should not be required,
+        and more precise permissions can be managed via roles.
+
         Admin users have extra privileges:
          - Use the admin panel to see list of users logged in
          - Add / remove users in some authenticators
@@ -112,7 +131,7 @@ class Authenticator(LoggingConfigurable):
 
         Use this with supported authenticators to restrict which users can log in. This is an
         additional list that further restricts users, beyond whatever restrictions the
-        authenticator has in place.
+        authenticator has in place. Any user in this list is granted the 'user' role on hub startup.
 
         If empty, does not perform any additional restriction.
 
@@ -185,6 +204,13 @@ class Authenticator(LoggingConfigurable):
         """
     )
 
+    def get_custom_html(self, base_url):
+        """Get custom HTML for the authenticator.
+
+        .. versionadded: 1.4
+        """
+        return self.custom_html
+
     login_service = Unicode(
         help="""
         Name of the login service that this authenticator is providing using to authenticate users.
@@ -229,6 +255,9 @@ class Authenticator(LoggingConfigurable):
             return False
         if not username:
             # empty usernames are not allowed
+            return False
+        if username != username.strip():
+            # starting/ending with space is not allowed
             return False
         if not self.username_regex:
             return True
@@ -328,6 +357,7 @@ class Authenticator(LoggingConfigurable):
                         ),
                         DeprecationWarning,
                     )
+
                     # use old name instead of new
                     # if old name is overridden in subclass
                     def _new_calls_old(old_name, *args, **kwargs):
@@ -571,9 +601,13 @@ class Authenticator(LoggingConfigurable):
                 or None if Authentication failed.
 
                 The Authenticator may return a dict instead, which MUST have a
-                key `name` holding the username, and MAY have two optional keys
-                set: `auth_state`, a dictionary of of auth state that will be
-                persisted; and `admin`, the admin setting value for the user.
+                key `name` holding the username, and MAY have additional keys:
+
+                - `auth_state`, a dictionary of of auth state that will be
+                  persisted;
+                - `admin`, the admin setting value for the user
+                - `groups`, the list of group names the user should be a member of,
+                  if Authenticator.manage_groups is True.
         """
 
     def pre_spawn_start(self, user, spawner):
@@ -624,6 +658,19 @@ class Authenticator(LoggingConfigurable):
         """
         self.allowed_users.discard(user.name)
 
+    manage_groups = Bool(
+        False,
+        config=True,
+        help="""Let authenticator manage user groups
+
+        If True, Authenticator.authenticate and/or .refresh_user
+        may return a list of group names in the 'groups' field,
+        which will be assigned to the user.
+
+        All group-assignment APIs are disabled if this is True.
+        """,
+    )
+
     auto_login = Bool(
         False,
         config=True,
@@ -636,6 +683,26 @@ class Authenticator(LoggingConfigurable):
         registered with `.get_handlers()`.
 
         .. versionadded:: 0.8
+        """,
+    )
+
+    auto_login_oauth2_authorize = Bool(
+        False,
+        config=True,
+        help="""
+        Automatically begin login process for OAuth2 authorization requests
+
+        When another application is using JupyterHub as OAuth2 provider, it
+        sends users to `/hub/api/oauth2/authorize`. If the user isn't logged
+        in already, and auto_login is not set, the user will be dumped on the
+        hub's home page, without any context on what to do next.
+
+        Setting this to true will automatically redirect users to login if
+        they aren't logged in *only* on the `/hub/api/oauth2/authorize`
+        endpoint.
+
+        .. versionadded:: 1.5
+
         """,
     )
 
@@ -710,8 +777,6 @@ def _deprecated_method(old_name, new_name, version):
     return deprecated
 
 
-import types
-
 # deprecate white/blacklist method names
 for _old_name, _new_name, _version in [
     ("check_whitelist", "check_allowed", "1.2"),
@@ -769,7 +834,7 @@ class LocalAuthenticator(Authenticator):
             raise ValueError("I don't know how to create users on OS X")
         elif which('pw'):
             # Probably BSD
-            return ['pw', 'useradd', '-m']
+            return ['pw', 'useradd', '-m', '-n']
         else:
             # This appears to be the Linux non-interactive adduser command:
             return ['adduser', '-q', '--gecos', '""', '--disabled-password']
@@ -894,12 +959,12 @@ class LocalAuthenticator(Authenticator):
         except KeyError:
             self.log.debug("No UID for user %s" % name)
         cmd += [name]
-        self.log.info("Creating user: %s", ' '.join(map(pipes.quote, cmd)))
+        self.log.info("Creating user: %s", ' '.join(map(shlex.quote, cmd)))
         p = Popen(cmd, stdout=PIPE, stderr=STDOUT)
         p.wait()
         if p.returncode:
             err = p.stdout.read().decode('utf8', 'replace')
-            raise RuntimeError("Failed to create system user %s: %s" % (name, err))
+            raise RuntimeError(f"Failed to create system user {name}: {err}")
 
 
 class PAMAuthenticator(LocalAuthenticator):
@@ -927,16 +992,24 @@ class PAMAuthenticator(LocalAuthenticator):
     ).tag(config=True)
 
     open_sessions = Bool(
-        True,
+        False,
         help="""
         Whether to open a new PAM session when spawners are started.
 
-        This may trigger things like mounting shared filsystems,
-        loading credentials, etc. depending on system configuration,
-        but it does not always work.
+        This may trigger things like mounting shared filesystems,
+        loading credentials, etc. depending on system configuration.
+
+        The lifecycle of PAM sessions is not correct,
+        so many PAM session configurations will not work.
 
         If any errors are encountered when opening/closing PAM sessions,
         this is automatically set to False.
+
+        .. versionchanged:: 2.2
+
+            Due to longstanding problems in the session lifecycle,
+            this is now disabled by default.
+            You may opt-in to opening sessions by setting this to True.
         """,
     ).tag(config=True)
 
@@ -945,8 +1018,8 @@ class PAMAuthenticator(LocalAuthenticator):
         help="""
         Whether to check the user's account status via PAM during authentication.
 
-        The PAM account stack performs non-authentication based account 
-        management. It is typically used to restrict/permit access to a 
+        The PAM account stack performs non-authentication based account
+        management. It is typically used to restrict/permit access to a
         service and this step is needed to access the host's user access control.
 
         Disabling this can be dangerous as authenticated but unauthorized users may
@@ -960,6 +1033,10 @@ class PAMAuthenticator(LocalAuthenticator):
         Users not in these groups can still be granted admin status through admin_users.
 
         allowed/blocked rules still apply.
+
+        Note: As of JupyterHub 2.0,
+        full admin rights should not be required,
+        and more precise permissions can be managed via roles.
         """
     ).tag(config=True)
 
@@ -1138,3 +1215,22 @@ class DummyAuthenticator(Authenticator):
                 return data['username']
             return None
         return data['username']
+
+
+class NullAuthenticator(Authenticator):
+    """Null Authenticator for JupyterHub
+
+    For cases where authentication should be disabled,
+    e.g. only allowing access via API tokens.
+
+    .. versionadded:: 2.0
+    """
+
+    # auto_login skips 'Login with...' page on Hub 0.8
+    auto_login = True
+
+    # for Hub 0.7, show 'login with...'
+    login_service = 'null'
+
+    def get_handlers(self, app):
+        return []

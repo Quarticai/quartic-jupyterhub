@@ -2,15 +2,14 @@
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 import json
+import logging
 import traceback
+from functools import partial
 from http.cookies import SimpleCookie
-from urllib.parse import urlparse
-from urllib.parse import urlunparse
+from urllib.parse import urlparse, urlunparse
 
-from tornado.log import access_log
-from tornado.log import LogFormatter
-from tornado.web import HTTPError
-from tornado.web import StaticFileHandler
+from tornado.log import LogFormatter, access_log
+from tornado.web import HTTPError, StaticFileHandler
 
 from .handlers.pages import HealthCheckHandler
 from .metrics import prometheus_log_method
@@ -67,7 +66,7 @@ class CoroutineLogFormatter(LogFormatter):
 # url params to be scrubbed if seen
 # any url param that *contains* one of these
 # will be scrubbed from logs
-SCRUB_PARAM_KEYS = ('token', 'auth', 'key', 'code', 'state')
+SCRUB_PARAM_KEYS = ('token', 'auth', 'key', 'code', 'state', '_xsrf')
 
 
 def _scrub_uri(uri):
@@ -104,13 +103,18 @@ def _scrub_headers(headers):
         else:
             # no space, hide the whole thing in case there was a mistake
             auth_type = ''
-        headers['Authorization'] = '{} [secret]'.format(auth_type)
+        headers['Authorization'] = f'{auth_type} [secret]'
     if 'Cookie' in headers:
-        c = SimpleCookie(headers['Cookie'])
-        redacted = []
-        for name in c.keys():
-            redacted.append("{}=[secret]".format(name))
-        headers['Cookie'] = '; '.join(redacted)
+        try:
+            c = SimpleCookie(headers['Cookie'])
+        except Exception as e:
+            # it's possible for browsers to send invalid cookies
+            headers['Cookie'] = f"Invalid Cookie: {e}"
+        else:
+            redacted = []
+            for name in c.keys():
+                redacted.append(f"{name}=[secret]")
+            headers['Cookie'] = '; '.join(redacted)
     return headers
 
 
@@ -132,18 +136,24 @@ def log_request(handler):
         status < 300 and isinstance(handler, (StaticFileHandler, HealthCheckHandler))
     ):
         # static-file success and 304 Found are debug-level
-        log_method = access_log.debug
+        log_level = logging.DEBUG
     elif status < 400:
-        log_method = access_log.info
+        log_level = logging.INFO
     elif status < 500:
-        log_method = access_log.warning
+        log_level = logging.WARNING
     else:
-        log_method = access_log.error
+        log_level = logging.ERROR
 
     uri = _scrub_uri(request.uri)
     headers = _scrub_headers(request.headers)
 
     request_time = 1000.0 * handler.request.request_time()
+
+    # always log slow responses (longer than 1s) at least info-level
+    if request_time >= 1000 and log_level < logging.INFO:
+        log_level = logging.INFO
+
+    log_method = partial(access_log.log, log_level)
 
     try:
         user = handler.current_user
@@ -177,6 +187,6 @@ def log_request(handler):
         # to get headers from tornado
         location = handler._headers.get('Location')
         if location:
-            ns['location'] = ' -> {}'.format(_scrub_uri(location))
+            ns['location'] = f' -> {_scrub_uri(location)}'
     log_method(msg.format(**ns))
     prometheus_log_method(handler)

@@ -26,45 +26,29 @@ Fixtures to add functionality or spawning behavior
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 import asyncio
-import inspect
-import logging
+import copy
 import os
 import sys
 from getpass import getuser
 from subprocess import TimeoutExpired
 from unittest import mock
 
-from pytest import fixture
-from pytest import raises
-from tornado import ioloop
+from pytest import fixture, raises
 from tornado.httpclient import HTTPError
 from tornado.platform.asyncio import AsyncIOMainLoop
 
 import jupyterhub.services.service
-from . import mocking
-from .. import crypto
-from .. import orm
+
+from .. import crypto, orm, scopes
+from ..roles import create_role, get_default_roles, mock_roles, update_roles
 from ..utils import random_port
+from . import mocking
 from .mocking import MockHub
 from .test_services import mockservice_cmd
 from .utils import add_user
-from .utils import ssl_setup
 
 # global db session object
 _db = None
-
-
-def pytest_collection_modifyitems(items):
-    """This function is automatically run by pytest passing all collected test
-    functions.
-
-    We use it to add asyncio marker to all async tests and assert we don't use
-    test functions that are async generators which wouldn't make sense.
-    """
-    for item in items:
-        if inspect.iscoroutinefunction(item.obj):
-            item.add_marker('asyncio')
-        assert not inspect.isasyncgenfunction(item.obj)
 
 
 @fixture(scope='module')
@@ -73,7 +57,7 @@ def ssl_tmpdir(tmpdir_factory):
 
 
 @fixture(scope='module')
-def app(request, io_loop, ssl_tmpdir):
+async def app(request, io_loop, ssl_tmpdir):
     """Mock a jupyterhub app for testing"""
     mocked_app = None
     ssl_enabled = getattr(
@@ -85,10 +69,6 @@ def app(request, io_loop, ssl_tmpdir):
 
     mocked_app = MockHub.instance(**kwargs)
 
-    async def make_app():
-        await mocked_app.initialize([])
-        await mocked_app.start()
-
     def fin():
         # disconnect logging during cleanup because pytest closes captured FDs prematurely
         mocked_app.log.handlers = []
@@ -99,7 +79,8 @@ def app(request, io_loop, ssl_tmpdir):
             print("Error stopping Hub: %s" % e, file=sys.stderr)
 
     request.addfinalizer(fin)
-    io_loop.run_sync(make_app)
+    await mocked_app.initialize([])
+    await mocked_app.start()
     return mocked_app
 
 
@@ -123,7 +104,13 @@ def db():
     """Get a db session"""
     global _db
     if _db is None:
-        _db = orm.new_session_factory('sqlite:///:memory:')()
+        # make sure some initial db contents are filled out
+        # specifically, the 'default' jupyterhub oauth client
+        app = MockHub(db_url='sqlite:///:memory:')
+        app.init_db()
+        _db = app.db
+        for role in get_default_roles():
+            create_role(_db, role)
         user = orm.User(name=getuser())
         _db.add(user)
         _db.commit()
@@ -139,16 +126,18 @@ def event_loop(request):
 
 
 @fixture(scope='module')
-def io_loop(event_loop, request):
-    """Same as pytest-tornado.io_loop, but re-scoped to module-level"""
-    ioloop.IOLoop.configure(AsyncIOMainLoop)
+async def io_loop(event_loop, request):
+    """Mostly obsolete fixture for tornado event loop
+
+    Main purpose is to register cleanup (close) after we're done with the loop.
+    The main reason to depend on this fixture is to ensure your cleanup
+    happens before the io_loop is closed.
+    """
     io_loop = AsyncIOMainLoop()
-    io_loop.make_current()
     assert asyncio.get_event_loop() is event_loop
     assert io_loop.asyncio_loop is event_loop
 
     def _close():
-        io_loop.clear_current()
         io_loop.close(all_fds=True)
 
     request.addfinalizer(_close)
@@ -156,26 +145,41 @@ def io_loop(event_loop, request):
 
 
 @fixture(autouse=True)
-def cleanup_after(request, io_loop):
+async def cleanup_after(request, io_loop):
     """function-scoped fixture to shutdown user servers
 
     allows cleanup of servers between tests
     without having to launch a whole new app
+
+    depends on io_loop to ensure it runs before things are closed.
     """
+
     try:
         yield
     finally:
+        if _db is not None:
+            # cleanup after failed transactions
+            _db.rollback()
+
         if not MockHub.initialized():
             return
         app = MockHub.instance()
-        for uid, user in app.users.items():
+        if app.db_file.closed:
+            return
+        for uid, user in list(app.users.items()):
             for name, spawner in list(user.spawners.items()):
                 if spawner.active:
                     try:
-                        io_loop.run_sync(lambda: app.proxy.delete_user(user, name))
+                        await app.proxy.delete_user(user, name)
                     except HTTPError:
                         pass
-                    io_loop.run_sync(lambda: user.stop(name))
+                    print(f"Stopping leftover server {spawner._log_name}")
+                    await user.stop(name)
+            if user.name not in {'admin', 'user'}:
+                app.users.delete(uid)
+        # delete groups
+        for group in app.db.query(orm.Group):
+            app.db.delete(group)
         app.db.commit()
 
 
@@ -186,7 +190,7 @@ def new_username(prefix='testuser'):
     """Return a new unique username"""
     global _username_counter
     _username_counter += 1
-    return '{}-{}'.format(prefix, _username_counter)
+    return f'{prefix}-{_username_counter}'
 
 
 @fixture
@@ -215,6 +219,39 @@ def admin_user(app, username):
     yield user
 
 
+_groupname_counter = 0
+
+
+def new_group_name(prefix='testgroup'):
+    """Return a new unique group name"""
+    global _groupname_counter
+    _groupname_counter += 1
+    return f'{prefix}-{_groupname_counter}'
+
+
+@fixture
+def groupname():
+    """allocate a temporary group name
+
+    unique each time the fixture is used
+    """
+    yield new_group_name()
+
+
+@fixture
+def group(app):
+    """Fixture for creating a temporary group
+
+    Each time the fixture is used, a new group is created
+
+    The group is deleted after the test
+    """
+    group = orm.Group(name=new_group_name())
+    app.db.add(group)
+    app.db.commit()
+    yield group
+
+
 class MockServiceSpawner(jupyterhub.services.service._ServiceSpawner):
     """mock services for testing.
 
@@ -227,7 +264,22 @@ class MockServiceSpawner(jupyterhub.services.service._ServiceSpawner):
 _mock_service_counter = 0
 
 
-def _mockservice(request, app, url=False):
+async def _mockservice(request, app, external=False, url=False):
+    """
+    Add a service to the application
+
+    Args:
+        request: pytest request fixture
+        app: MockHub application
+        external (bool):
+          If False (default), launch the service.
+          Otherwise, consider it 'external,
+          registering a service in the database,
+          but don't start it.
+        url (bool):
+          If True, register the service at a URL
+          (as opposed to headless, API-only).
+    """
     global _mock_service_counter
     _mock_service_counter += 1
     name = 'mock-service-%i' % _mock_service_counter
@@ -238,47 +290,61 @@ def _mockservice(request, app, url=False):
         else:
             spec['url'] = 'http://127.0.0.1:%i' % random_port()
 
-    io_loop = app.io_loop
+    if external:
+        spec['oauth_redirect_uri'] = 'http://127.0.0.1:%i' % random_port()
+
+    event_loop = asyncio.get_running_loop()
 
     with mock.patch.object(
         jupyterhub.services.service, '_ServiceSpawner', MockServiceSpawner
     ):
         app.services = [spec]
         app.init_services()
+        mock_roles(app, name, 'services')
         assert name in app._service_map
         service = app._service_map[name]
+        token = service.orm.api_tokens[0]
 
         async def start():
             # wait for proxy to be updated before starting the service
             await app.proxy.add_all_services(app._service_map)
-            service.start()
+            await service.start()
 
-        io_loop.run_sync(start)
+        if not external:
+            await start()
 
         def cleanup():
-            asyncio.get_event_loop().run_until_complete(service.stop())
+            if not external:
+                event_loop.run_until_complete(service.stop())
             app.services[:] = []
             app._service_map.clear()
 
         request.addfinalizer(cleanup)
         # ensure process finishes starting
-        with raises(TimeoutExpired):
-            service.proc.wait(1)
+        if not external:
+            with raises(TimeoutExpired):
+                service.proc.wait(1)
         if url:
-            io_loop.run_sync(service.server.wait_up)
+            await service.server.wait_up(http=True)
     return service
 
 
 @fixture
-def mockservice(request, app):
+async def mockservice(request, app):
     """Mock a service with no external service url"""
-    yield _mockservice(request, app, url=False)
+    yield await _mockservice(request, app, url=False)
 
 
 @fixture
-def mockservice_url(request, app):
+async def mockservice_external(request, app):
+    """Mock an externally managed service (don't start anything)"""
+    yield await _mockservice(request, app, external=True, url=False)
+
+
+@fixture
+async def mockservice_url(request, app):
     """Mock a service with its own url to test external services"""
-    yield _mockservice(request, app, url=True)
+    yield await _mockservice(request, app, url=True)
 
 
 @fixture
@@ -305,6 +371,15 @@ def slow_spawn(app):
 
 
 @fixture
+def full_spawn(app):
+    """Fixture enabling full instrumented server via InstrumentedSpawner"""
+    with mock.patch.dict(
+        app.tornado_settings, {'spawner_class': mocking.InstrumentedSpawner}
+    ):
+        yield
+
+
+@fixture
 def never_spawn(app):
     """Fixture enabling NeverSpawner"""
     with mock.patch.dict(app.tornado_settings, {'spawner_class': mocking.NeverSpawner}):
@@ -325,3 +400,87 @@ def slow_bad_spawn(app):
         app.tornado_settings, {'spawner_class': mocking.SlowBadSpawner}
     ):
         yield
+
+
+@fixture
+def create_temp_role(app):
+    """Generate a temporary role with certain scopes.
+    Convenience function that provides setup, database handling and teardown"""
+    temp_roles = []
+    index = [1]
+
+    def temp_role_creator(scopes, role_name=None):
+        if not role_name:
+            role_name = f'temp_role_{index[0]}'
+            index[0] += 1
+        temp_role = orm.Role(name=role_name, scopes=list(scopes))
+        temp_roles.append(temp_role)
+        app.db.add(temp_role)
+        app.db.commit()
+        return temp_role
+
+    yield temp_role_creator
+    for role in temp_roles:
+        app.db.delete(role)
+    app.db.commit()
+
+
+@fixture
+def create_user_with_scopes(app, create_temp_role):
+    """Generate a temporary user with specific scopes.
+    Convenience function that provides setup, database handling and teardown"""
+    temp_users = []
+    counter = 0
+    get_role = create_temp_role
+
+    def temp_user_creator(*scopes, name=None):
+        nonlocal counter
+        if name is None:
+            counter += 1
+            name = f"temp_user_{counter}"
+        role = get_role(scopes)
+        orm_user = orm.User(name=name)
+        app.db.add(orm_user)
+        app.db.commit()
+        temp_users.append(orm_user)
+        update_roles(app.db, orm_user, roles=[role.name])
+        return app.users[orm_user.id]
+
+    yield temp_user_creator
+    for user in temp_users:
+        app.users.delete(user)
+
+
+@fixture
+def create_service_with_scopes(app, create_temp_role):
+    """Generate a temporary service with specific scopes.
+    Convenience function that provides setup, database handling and teardown"""
+    temp_service = []
+    counter = 0
+    role_function = create_temp_role
+
+    def temp_service_creator(*scopes, name=None):
+        nonlocal counter
+        if name is None:
+            counter += 1
+            name = f"temp_service_{counter}"
+        role = role_function(scopes)
+        app.services.append({'name': name})
+        app.init_services()
+        orm_service = orm.Service.find(app.db, name)
+        app.db.commit()
+        update_roles(app.db, orm_service, roles=[role.name])
+        return orm_service
+
+    yield temp_service_creator
+    for service in temp_service:
+        app.db.delete(service)
+    app.db.commit()
+
+
+@fixture
+def preserve_scopes():
+    """Revert any custom scopes after test"""
+    scope_definitions = copy.deepcopy(scopes.scope_definitions)
+    yield scope_definitions
+    scopes.scope_definitions = scope_definitions

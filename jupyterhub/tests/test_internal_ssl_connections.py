@@ -1,16 +1,12 @@
 """Tests for jupyterhub internal_ssl connections"""
 import sys
 import time
-from subprocess import check_output
 from unittest import mock
-from urllib.parse import urlparse
 
 import pytest
-from requests.exceptions import ConnectionError
-from requests.exceptions import SSLError
-from tornado import gen
+from requests.exceptions import ConnectionError, SSLError
 
-import jupyterhub
+from ..utils import AnyTimeoutError
 from .test_api import add_user
 from .utils import async_requests
 
@@ -35,7 +31,7 @@ async def wait_for_spawner(spawner, timeout=10):
         assert status is None
         try:
             await wait()
-        except TimeoutError:
+        except AnyTimeoutError:
             continue
         else:
             break

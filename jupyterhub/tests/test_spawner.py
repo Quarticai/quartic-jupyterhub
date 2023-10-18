@@ -16,13 +16,11 @@ import pytest
 
 from .. import orm
 from .. import spawner as spawnermod
-from ..objects import Hub
-from ..objects import Server
-from ..spawner import LocalProcessSpawner
-from ..spawner import Spawner
+from ..objects import Hub, Server
+from ..scopes import access_scopes
+from ..spawner import LocalProcessSpawner, Spawner
 from ..user import User
-from ..utils import new_token
-from ..utils import url_path_join
+from ..utils import AnyTimeoutError, maybe_future, new_token, url_path_join
 from .mocking import public_url
 from .test_api import add_user
 from .utils import async_requests
@@ -80,6 +78,18 @@ async def test_spawner(db, request):
     assert isinstance(status, int)
 
 
+def test_spawner_from_db(app, user):
+    spawner = user.spawners['name']
+    user_options = {"test": "value"}
+    spawner.orm_spawner.user_options = user_options
+    app.db.commit()
+    # delete and recreate the spawner from the db
+    user.spawners.pop('name')
+    new_spawner = user.spawners['name']
+    assert new_spawner.orm_spawner.user_options == user_options
+    assert new_spawner.user_options == user_options
+
+
 async def wait_for_spawner(spawner, timeout=10):
     """Wait for an http server to show up
 
@@ -95,7 +105,7 @@ async def wait_for_spawner(spawner, timeout=10):
         assert status is None
         try:
             await wait()
-        except TimeoutError:
+        except AnyTimeoutError:
             continue
         else:
             break
@@ -258,12 +268,11 @@ async def test_shell_cmd(db, tmpdir, request):
 
 
 def test_inherit_overwrite():
-    """On 3.6+ we check things are overwritten at import time"""
-    if sys.version_info >= (3, 6):
-        with pytest.raises(NotImplementedError):
+    """We check things are overwritten at import time"""
+    with pytest.raises(NotImplementedError):
 
-            class S(Spawner):
-                pass
+        class S(Spawner):
+            pass
 
 
 def test_inherit_ok():
@@ -327,6 +336,12 @@ async def test_spawner_insert_api_token(app):
     assert found
     assert found.user.name == user.name
     assert user.api_tokens == [found]
+    # resolve `!server` filter in server role
+    server_role_scopes = {
+        s.replace("!server", f"!server={user.name}/")
+        for s in orm.Role.find(app.db, "server").scopes
+    }
+    assert set(found.scopes) == server_role_scopes
     await user.stop()
 
 
@@ -350,6 +365,58 @@ async def test_spawner_bad_api_token(app):
         await user.spawn()
     assert orm.APIToken.find(app.db, other_token) is None
     assert other_user.api_tokens == []
+
+
+@pytest.mark.parametrize(
+    "have_scopes, request_scopes, expected_scopes",
+    [
+        (["self"], ["inherit"], ["inherit"]),
+        (["self"], [], ["access:servers!server=USER/", "users:activity!user"]),
+        (
+            ["self"],
+            ["admin:groups", "read:servers!server"],
+            ["users:activity!user", "read:servers!server=USER/"],
+        ),
+        (
+            ["self", "read:groups!group=x", "users:activity"],
+            ["admin:groups", "users:activity"],
+            ["read:groups!group=x", "read:groups:name!group=x", "users:activity"],
+        ),
+    ],
+)
+async def test_server_token_scopes(
+    app, username, create_user_with_scopes, have_scopes, request_scopes, expected_scopes
+):
+    """Token provided by spawner is not in the db
+
+    Insert token into db as a user-provided token.
+    """
+    db = app.db
+
+    # apply templating
+    def _format_scopes(scopes):
+        if callable(scopes):
+
+            async def get_scopes(*args):
+                return _format_scopes(await maybe_future(scopes(*args)))
+
+            return get_scopes
+
+        return [s.replace("USER", username) for s in scopes]
+
+    have_scopes = _format_scopes(have_scopes)
+    request_scopes = _format_scopes(request_scopes)
+    expected_scopes = _format_scopes(expected_scopes)
+
+    user = create_user_with_scopes(*have_scopes, name=username)
+    spawner = user.spawner
+    spawner.server_token_scopes = request_scopes
+
+    await user.spawn()
+    orm_token = orm.APIToken.find(db, spawner.api_token)
+    assert orm_token
+    assert set(orm_token.scopes) == set(expected_scopes)
+    await user.stop()
 
 
 async def test_spawner_delete_server(app):
@@ -415,3 +482,114 @@ async def test_spawner_env(db):
     for key, value in env_overrides.items():
         assert key in env
         assert env[key] == value
+
+
+async def test_hub_connect_url(db):
+    spawner = new_spawner(db, hub_connect_url="https://example.com/")
+    name = spawner.user.name
+    env = spawner.get_env()
+    assert env["JUPYTERHUB_API_URL"] == "https://example.com/api"
+    assert (
+        env["JUPYTERHUB_ACTIVITY_URL"]
+        == "https://example.com/api/users/%s/activity" % name
+    )
+
+
+async def test_spawner_oauth_scopes(app, user):
+    allowed_scopes = ["read:users"]
+    spawner = user.spawners['']
+    spawner.oauth_client_allowed_scopes = allowed_scopes
+    # exercise start/stop which assign roles to oauth client
+    await spawner.user.spawn()
+    oauth_client = spawner.orm_spawner.oauth_client
+    assert sorted(oauth_client.allowed_scopes) == sorted(
+        allowed_scopes + list(access_scopes(oauth_client))
+    )
+    await spawner.user.stop()
+
+
+async def test_spawner_oauth_roles_bad(app, user):
+    allowed_roles = ["user", "nosuchrole"]
+    spawner = user.spawners['']
+    spawner.oauth_roles = allowed_roles
+    # exercise start/stop which assign roles
+    # raises ValueError if we try to assign a role that doesn't exist
+    with pytest.raises(ValueError):
+        await spawner.user.spawn()
+
+
+async def test_spawner_options_from_form(db):
+    def options_from_form(form_data):
+        return form_data
+
+    spawner = new_spawner(db, options_from_form=options_from_form)
+    form_data = {"key": ["value"]}
+    result = spawner.run_options_from_form(form_data)
+    for key, value in form_data.items():
+        assert key in result
+        assert result[key] == value
+
+
+async def test_spawner_options_from_form_with_spawner(db):
+    def options_from_form(form_data, spawner):
+        return form_data
+
+    spawner = new_spawner(db, options_from_form=options_from_form)
+    form_data = {"key": ["value"]}
+    result = spawner.run_options_from_form(form_data)
+    for key, value in form_data.items():
+        assert key in result
+        assert result[key] == value
+
+
+def test_spawner_server(db):
+    spawner = new_spawner(db)
+    spawner.orm_spawner = None
+    orm_spawner = orm.Spawner()
+    orm_server = orm.Server(base_url="/1/")
+    orm_spawner.server = orm_server
+    db.add(orm_spawner)
+    db.add(orm_server)
+    db.commit()
+    # initial: no orm_spawner
+    assert spawner.server is None
+    # assigning spawner.orm_spawner updates spawner.server
+    spawner.orm_spawner = orm_spawner
+    assert spawner.server is not None
+    assert spawner.server.orm_server is orm_server
+    # update orm_spawner.server without direct access on Spawner
+    orm_spawner.server = new_server = orm.Server(base_url="/2/")
+    db.commit()
+    assert spawner.server is not None
+    assert spawner.server.orm_server is not orm_server
+    assert spawner.server.orm_server is new_server
+    # clear orm_server via orm_spawner clears spawner.server
+    orm_spawner.server = None
+    db.commit()
+    assert spawner.server is None
+    # assigning spawner.server updates orm_spawner.server
+    orm_server = orm.Server(base_url="/3/")
+    db.add(orm_server)
+    db.commit()
+    spawner.server = server = Server(orm_server=orm_server)
+    db.commit()
+    assert spawner.server is server
+    assert spawner.orm_spawner.server is orm_server
+    # change orm spawner.server
+    orm_server = orm.Server(base_url="/4/")
+    db.add(orm_server)
+    db.commit()
+    spawner.server = server2 = Server(orm_server=orm_server)
+    assert spawner.server is server2
+    assert spawner.orm_spawner.server is orm_server
+    # clear server via spawner.server
+    spawner.server = None
+    db.commit()
+    assert spawner.orm_spawner.server is None
+
+    # test with no underlying orm.Spawner
+    # (only relevant for mocking, never true for actual Spawners)
+    spawner = Spawner()
+    spawner.server = Server.from_url("http://1.2.3.4")
+    assert spawner.server is not None
+    assert spawner.server.ip == "1.2.3.4"

@@ -9,45 +9,54 @@ with JupyterHub authentication mixins enabled.
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 import asyncio
-import importlib
 import json
+import logging
 import os
 import random
-from datetime import datetime
+import secrets
+import sys
+import warnings
 from datetime import timezone
+from importlib import import_module
+from pathlib import Path
 from textwrap import dedent
 from urllib.parse import urlparse
 
-from jinja2 import ChoiceLoader
-from jinja2 import FunctionLoader
+from jinja2 import ChoiceLoader, FunctionLoader
 from tornado import ioloop
-from tornado.httpclient import AsyncHTTPClient
-from tornado.httpclient import HTTPRequest
-from tornado.web import HTTPError
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.web import RequestHandler
-from traitlets import Any
-from traitlets import Bool
-from traitlets import Bytes
-from traitlets import CUnicode
-from traitlets import default
-from traitlets import import_item
-from traitlets import Integer
-from traitlets import observe
-from traitlets import TraitError
-from traitlets import Unicode
-from traitlets import validate
+from traitlets import (
+    Any,
+    Bool,
+    Bytes,
+    CUnicode,
+    Integer,
+    TraitError,
+    Unicode,
+    default,
+    import_item,
+    observe,
+    validate,
+)
 from traitlets.config import Configurable
 
-from .._version import __version__
-from .._version import _check_version
+from .._version import __version__, _check_version
 from ..log import log_request
-from ..services.auth import HubOAuth
-from ..services.auth import HubOAuthCallbackHandler
-from ..services.auth import HubOAuthenticated
-from ..utils import exponential_backoff
-from ..utils import isoformat
-from ..utils import make_ssl_context
-from ..utils import url_path_join
+from ..services.auth import HubOAuth, HubOAuthCallbackHandler, HubOAuthenticated
+from ..utils import exponential_backoff, isoformat, make_ssl_context, url_path_join
+from ._disable_user_config import _disable_user_config, _exclude_home
+
+
+def _bool_env(key):
+    """Cast an environment variable to bool
+
+    0, empty, or unset is False; All other values are True.
+    """
+    if os.environ.get(key, "") in {"", "0"}:
+        return False
+    else:
+        return True
 
 
 # Authenticate requests with the Hub
@@ -94,14 +103,31 @@ class JupyterHubLoginHandlerMixin:
 
     @staticmethod
     def get_user(handler):
-        """alternative get_current_user to query the Hub"""
-        # patch in HubAuthenticated class for querying the Hub for cookie authentication
-        if HubAuthenticatedHandler not in handler.__class__.__bases__:
+        """alternative get_current_user to query the Hub
+
+        Thus shouldn't be called anymore because HubAuthenticatedHandler
+        should have already overridden get_current_user().
+
+        Keep here to protect uncommon circumstance of multiple BaseHandlers
+        from missing auth.
+
+        e.g. when multiple BaseHandler classes are used.
+        """
+        if HubAuthenticatedHandler not in handler.__class__.mro():
+            warnings.warn(
+                f"Expected to see HubAuthenticatedHandler in {handler.__class__}.mro(),"
+                " patching in at call time. Hub authentication is still applied.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            # patch HubAuthenticated into the instance
             handler.__class__ = type(
                 handler.__class__.__name__,
                 (HubAuthenticatedHandler, handler.__class__),
                 {},
             )
+            # patch into the class itself so this doesn't happen again for the same class
+            patch_base_handler(handler.__class__)
         return handler.get_current_user()
 
     @classmethod
@@ -131,7 +157,6 @@ class OAuthCallbackHandlerMixin(HubOAuthCallbackHandler):
 aliases = {
     'user': 'SingleUserNotebookApp.user',
     'group': 'SingleUserNotebookApp.group',
-    'cookie-name': 'HubAuth.cookie_name',
     'hub-prefix': 'SingleUserNotebookApp.hub_prefix',
     'hub-host': 'SingleUserNotebookApp.hub_host',
     'hub-api-url': 'SingleUserNotebookApp.hub_api_url',
@@ -143,69 +168,6 @@ flags = {
         "Disable user-controlled configuration of the notebook server.",
     )
 }
-
-
-page_template = """
-{% extends "templates/page.html" %}
-
-{% block header_buttons %}
-{{super()}}
-
-<span>
-    <a href='{{hub_control_panel_url}}'
-       class='btn btn-default btn-sm navbar-btn pull-right'
-       style='margin-right: 4px; margin-left: 2px;'>
-        Control Panel
-    </a>
-</span>
-{% endblock %}
-
-{% block logo %}
-<img src='{{logo_url}}' alt='Jupyter Notebook'/>
-{% endblock logo %}
-
-{% block script %}
-{{ super() }}
-<script type='text/javascript'>
-  function _remove_redirects_param() {
-    // remove ?redirects= param from URL so that
-    // successful page loads don't increment the redirect loop counter
-    if (window.location.search.length <= 1) {
-      return;
-    }
-    var search_parameters = window.location.search.slice(1).split('&');
-    for (var i = 0; i < search_parameters.length; i++) {
-      if (search_parameters[i].split('=')[0] === 'redirects') {
-        // remote token from search parameters
-        search_parameters.splice(i, 1);
-        var new_search = '';
-        if (search_parameters.length) {
-          new_search = '?' + search_parameters.join('&');
-        }
-        var new_url = window.location.origin +
-                      window.location.pathname +
-                      new_search +
-                      window.location.hash;
-        window.history.replaceState({}, "", new_url);
-        return;
-      }
-    }
-  }
-  _remove_redirects_param();
-</script>
-{% endblock script %}
-"""
-
-
-def _exclude_home(path_list):
-    """Filter out any entries in a path list that are in my home directory.
-
-    Used to disable per-user configuration.
-    """
-    home = os.path.expanduser('~')
-    for p in path_list:
-        if not p.startswith(home):
-            yield p
 
 
 class SingleUserNotebookAppMixin(Configurable):
@@ -243,7 +205,7 @@ class SingleUserNotebookAppMixin(Configurable):
     cookie_secret = Bytes()
 
     def _cookie_secret_default(self):
-        return os.urandom(32)
+        return secrets.token_bytes(32)
 
     user = CUnicode().tag(config=True)
     group = CUnicode().tag(config=True)
@@ -259,6 +221,10 @@ class SingleUserNotebookAppMixin(Configurable):
     @observe('user')
     def _user_changed(self, change):
         self.log.name = change.new
+
+    @default("default_url")
+    def _default_url(self):
+        return os.environ.get("JUPYTERHUB_DEFAULT_URL", "/tree/")
 
     hub_host = Unicode().tag(config=True)
 
@@ -342,7 +308,26 @@ class SingleUserNotebookAppMixin(Configurable):
         """,
     ).tag(config=True)
 
-    @validate('notebook_dir')
+    @default("disable_user_config")
+    def _default_disable_user_config(self):
+        return _bool_env("JUPYTERHUB_DISABLE_USER_CONFIG")
+
+    @default("root_dir")
+    def _default_root_dir(self):
+        if os.environ.get("JUPYTERHUB_ROOT_DIR"):
+            proposal = {"value": os.environ["JUPYTERHUB_ROOT_DIR"]}
+            # explicitly call validator, not called on default values
+            return self._notebook_dir_validate(proposal)
+        else:
+            return os.getcwd()
+
+    # notebook_dir is used by the classic notebook server
+    # root_dir is the future in jupyter server
+    @default("notebook_dir")
+    def _default_notebook_dir(self):
+        return self._default_root_dir()
+
+    @validate("notebook_dir", "root_dir")
     def _notebook_dir_validate(self, proposal):
         value = os.path.expanduser(proposal['value'])
         # Strip any trailing slashes
@@ -357,6 +342,13 @@ class SingleUserNotebookAppMixin(Configurable):
         if not os.path.isdir(value):
             raise TraitError("No such notebook dir: %r" % value)
         return value
+
+    @default('log_level')
+    def _log_level_default(self):
+        if _bool_env("JUPYTERHUB_DEBUG"):
+            return logging.DEBUG
+        else:
+            return logging.INFO
 
     @default('log_datefmt')
     def _log_datefmt_default(self):
@@ -433,7 +425,7 @@ class SingleUserNotebookAppMixin(Configurable):
                     i,
                     RETRIES,
                 )
-                await asyncio.sleep(min(2 ** i, 16))
+                await asyncio.sleep(min(2**i, 16))
             else:
                 break
         else:
@@ -501,7 +493,7 @@ class SingleUserNotebookAppMixin(Configurable):
                 url=self.hub_activity_url,
                 method='POST',
                 headers={
-                    "Authorization": "token {}".format(self.hub_auth.api_token),
+                    "Authorization": f"token {self.hub_auth.api_token}",
                     "Content-Type": "application/json",
                 },
                 body=json.dumps(
@@ -547,17 +539,103 @@ class SingleUserNotebookAppMixin(Configurable):
             t = self.hub_activity_interval * (1 + 0.2 * (random.random() - 0.5))
             await asyncio.sleep(t)
 
+    def _log_app_versions(self):
+        """Log application versions at startup
+
+        Logs versions of jupyterhub and singleuser-server base versions (jupyterlab, jupyter_server, notebook)
+        """
+        self.log.info(f"Starting jupyterhub single-user server version {__version__}")
+
+        # don't log these package versions
+        seen = {"jupyterhub", "traitlets", "jupyter_core", "builtins"}
+
+        for cls in self.__class__.mro():
+            module_name = cls.__module__.partition(".")[0]
+            if module_name not in seen:
+                seen.add(module_name)
+                try:
+                    mod = import_module(module_name)
+                    mod_version = getattr(mod, "__version__")
+                except Exception:
+                    mod_version = ""
+                self.log.info(
+                    f"Extending {cls.__module__}.{cls.__name__} from {module_name} {mod_version}"
+                )
+
+    # load test extension, if we're testing
+    def init_server_extension_config(self):
+        """
+        Overloads a method in classic notebook server's NotebookApp class
+        (notebook < 7) to conditionally enable a jupyterhub test extension.
+
+        ref: https://github.com/jupyter/notebook/blob/v6.5.2/notebook/notebookapp.py#L1982
+        """
+        super().init_server_extension_config()
+        if os.getenv("JUPYTERHUB_SINGLEUSER_TEST_EXTENSION") == "1":
+            self.log.warning("Enabling jupyterhub test extension, classic edition")
+            self.nbserver_extensions["jupyterhub.tests.extension"] = True
+
+    def find_server_extensions(self):
+        """
+        Overloads a method in jupyter_server's ServerApp class (lab or notebook
+        >=7) to conditionally enable a jupyterhub test extension.
+
+        ref: https://github.com/jupyter-server/jupyter_server/blob/v2.2.1/jupyter_server/serverapp.py#L2238
+        """
+        super().find_server_extensions()
+        if os.getenv("JUPYTERHUB_SINGLEUSER_TEST_EXTENSION") == "1":
+            self.log.warning("Enabling jupyterhub test extension")
+            self.jpserver_extensions["jupyterhub.tests.extension"] = True
+
     def initialize(self, argv=None):
+        if self.disable_user_config:
+            _disable_user_config(self)
         # disable trash by default
         # this can be re-enabled by config
         self.config.FileContentsManager.delete_to_trash = False
-        return super().initialize(argv)
+        # load default-url env at higher priority than `@default`,
+        # which may have their own _defaults_ which should not override explicit default_url config
+        # via e.g. c.Spawner.default_url. Seen in jupyterlab's SingleUserLabApp.
+        default_url = os.environ.get("JUPYTERHUB_DEFAULT_URL")
+        if default_url:
+            self.config[self.__class__.__name__].default_url = default_url
+        self._log_app_versions()
+        # call our init_ioloop very early
+        # jupyter-server calls it too late, notebook doesn't define it yet
+        # only called in jupyter-server >= 1.9
+        self.init_ioloop()
+        super().initialize(argv)
+        self.patch_templates()
+
+    def init_ioloop(self):
+        """init_ioloop added in jupyter-server 1.9"""
+        # avoid deprecated access to current event loop
+        if getattr(self, "io_loop", None) is None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # not running, make our own loop
+                self.io_loop = ioloop.IOLoop(make_current=False)
+            else:
+                # running, use IOLoop.current
+                self.io_loop = ioloop.IOLoop.current()
+
+        # Make our event loop the 'current' event loop.
+        # FIXME: this shouldn't be necessary, but it is.
+        # notebookapp (<=6.4, at least), and
+        # jupyter-server (<=1.17.0, at least) still need the 'current' event loop to be defined
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.io_loop.make_current()
+
+    def init_httpserver(self):
+        self.io_loop.run_sync(super().init_httpserver)
 
     def start(self):
         self.log.info("Starting jupyterhub-singleuser server version %s", __version__)
         # start by hitting Hub to check version
-        ioloop.IOLoop.current().run_sync(self.check_hub_version)
-        ioloop.IOLoop.current().add_callback(self.keep_activity_updated)
+        self.io_loop.run_sync(self.check_hub_version)
+        self.io_loop.add_callback(self.keep_activity_updated)
         super().start()
 
     def init_hub_auth(self):
@@ -582,6 +660,7 @@ class SingleUserNotebookAppMixin(Configurable):
             certfile=self.certfile,
             client_ca=self.client_ca,
         )
+        self.hub_host = self.hub_auth.hub_host
         # smoke check
         if not self.hub_auth.oauth_client_id:
             raise ValueError("Missing OAuth client ID")
@@ -590,12 +669,14 @@ class SingleUserNotebookAppMixin(Configurable):
         # load the hub-related settings into the tornado settings dict
         self.init_hub_auth()
         s = self.tornado_settings
-        s['log_function'] = log_request
+        # if the user has configured a log function in the tornado settings, do not override it
+        s.setdefault('log_function', log_request)
         s['user'] = self.user
         s['group'] = self.group
         s['hub_prefix'] = self.hub_prefix
         s['hub_host'] = self.hub_host
         s['hub_auth'] = self.hub_auth
+        s['page_config_hook'] = self.page_config_hook
         csp_report_uri = s['csp_report_uri'] = self.hub_host + url_path_join(
             self.hub_prefix, 'security/csp-report'
         )
@@ -621,7 +702,18 @@ class SingleUserNotebookAppMixin(Configurable):
 
         # apply X-JupyterHub-Version to *all* request handlers (even redirects)
         self.patch_default_headers()
-        self.patch_templates()
+
+    def page_config_hook(self, handler, page_config):
+        """JupyterLab page config hook
+
+        Adds JupyterHub info to page config.
+
+        Places the JupyterHub API token in PageConfig.token.
+
+        Only has effect on jupyterlab_server >=2.9
+        """
+        page_config["token"] = self.hub_auth.get_token(handler) or ""
+        return page_config
 
     def patch_default_headers(self):
         if hasattr(RequestHandler, '_orig_set_default_headers'):
@@ -642,19 +734,48 @@ class SingleUserNotebookAppMixin(Configurable):
         )
         self.jinja_template_vars['hub_host'] = self.hub_host
         self.jinja_template_vars['hub_prefix'] = self.hub_prefix
-        env = self.web_app.settings['jinja2_env']
+        self.jinja_template_vars[
+            'hub_control_panel_url'
+        ] = self.hub_host + url_path_join(self.hub_prefix, 'home')
 
-        env.globals['hub_control_panel_url'] = self.hub_host + url_path_join(
-            self.hub_prefix, 'home'
-        )
+        settings = self.web_app.settings
+        # patch classic notebook jinja env
+        jinja_envs = []
+        if 'jinja2_env' in settings:
+            # default jinja env (should we do this on jupyter-server, or only notebook?)
+            jinja_envs.append(settings['jinja2_env'])
+        for ext_name in ("notebook", "nbclassic"):
+            env_name = f"{ext_name}_jinja2_env"
+            if env_name in settings:
+                # when running with jupyter-server, classic notebook (nbclassic server extension or notebook v7)
+                # gets its own jinja env, which needs the same patch
+                jinja_envs.append(settings[env_name])
 
-        # patch jinja env loading to modify page template
+        # patch jinja env loading to get modified template, only for base page.html
+        template_dir = Path(__file__).resolve().parent.joinpath("templates")
+        with template_dir.joinpath("page.html").open() as f:
+            page_template = f.read()
+
         def get_page(name):
             if name == 'page.html':
                 return page_template
 
-        orig_loader = env.loader
-        env.loader = ChoiceLoader([FunctionLoader(get_page), orig_loader])
+        for jinja_env in jinja_envs:
+            jinja_env.loader = ChoiceLoader(
+                [FunctionLoader(get_page), jinja_env.loader]
+            )
+
+    def load_server_extensions(self):
+        # Loading LabApp sets $JUPYTERHUB_API_TOKEN on load, which is incorrect
+        r = super().load_server_extensions()
+        # clear the token in PageConfig at this step
+        # so that cookie auth is used
+        # FIXME: in the future,
+        # it would probably make sense to set page_config.token to the token
+        # from the current request.
+        if 'page_config_data' in self.web_app.settings:
+            self.web_app.settings['page_config_data']['token'] = ''
+        return r
 
 
 def detect_base_package(App):
@@ -671,6 +792,97 @@ def detect_base_package(App):
         if pkg in {"notebook", "jupyter_server"}:
             return pkg
     return None
+
+
+def _nice_cls_repr(cls):
+    """Nice repr of classes, e.g. 'module.submod.Class'
+
+    Also accepts tuples of classes
+    """
+    return f"{cls.__module__}.{cls.__name__}"
+
+
+def patch_base_handler(BaseHandler, log=None):
+    """Patch HubAuthenticated into a base handler class
+
+    so anything inheriting from BaseHandler uses Hub authentication.
+    This works *even after* subclasses have imported and inherited from BaseHandler.
+
+    .. versionadded: 1.5
+        Made available as an importable utility
+    """
+    if log is None:
+        log = logging.getLogger()
+
+    if HubAuthenticatedHandler not in BaseHandler.__bases__:
+        new_bases = (HubAuthenticatedHandler,) + BaseHandler.__bases__
+        log.info(
+            "Patching auth into {mod}.{name}({old_bases}) -> {name}({new_bases})".format(
+                mod=BaseHandler.__module__,
+                name=BaseHandler.__name__,
+                old_bases=', '.join(
+                    _nice_cls_repr(cls) for cls in BaseHandler.__bases__
+                ),
+                new_bases=', '.join(_nice_cls_repr(cls) for cls in new_bases),
+            )
+        )
+        BaseHandler.__bases__ = new_bases
+        # We've now inserted our class as a parent of BaseHandler,
+        # but we also need to ensure BaseHandler *itself* doesn't
+        # override the public tornado API methods we have inserted.
+        # If they are defined in BaseHandler, explicitly replace them with our methods.
+        for name in ("get_current_user", "get_login_url"):
+            if name in BaseHandler.__dict__:
+                log.debug(
+                    f"Overriding {BaseHandler}.{name} with HubAuthenticatedHandler.{name}"
+                )
+                method = getattr(HubAuthenticatedHandler, name)
+                setattr(BaseHandler, name, method)
+    return BaseHandler
+
+
+def _patch_app_base_handlers(app):
+    """Patch Hub Authentication into the base handlers of an app
+
+    Patches HubAuthenticatedHandler into:
+
+    - App.base_handler_class (if defined)
+    - jupyter_server's JupyterHandler (if already imported)
+    - notebook's IPythonHandler (if already imported)
+    """
+    BaseHandler = app_base_handler = getattr(app, "base_handler_class", None)
+
+    base_handlers = []
+    if BaseHandler is not None:
+        base_handlers.append(BaseHandler)
+
+    # patch juptyer_server and notebook handlers if they have been imported
+    for base_handler_name in [
+        "jupyter_server.base.handlers.JupyterHandler",
+        "notebook.base.handlers.IPythonHandler",
+    ]:
+        modname, _ = base_handler_name.rsplit(".", 1)
+        if modname in sys.modules:
+            base_handlers.append(import_item(base_handler_name))
+
+    if not base_handlers:
+        pkg = detect_base_package(app.__class__)
+        if pkg == "jupyter_server":
+            BaseHandler = import_item("jupyter_server.base.handlers.JupyterHandler")
+        elif pkg == "notebook":
+            BaseHandler = import_item("notebook.base.handlers.IPythonHandler")
+        else:
+            raise ValueError(
+                f"{app.__class__.__name__}.base_handler_class must be defined"
+            )
+        base_handlers.append(BaseHandler)
+
+    # patch-in HubAuthenticatedHandler to base handler classes
+    for BaseHandler in base_handlers:
+        patch_base_handler(BaseHandler)
+
+    # return the first entry
+    return base_handlers[0]
 
 
 def make_singleuser_app(App):
@@ -691,23 +903,23 @@ def make_singleuser_app(App):
     """
 
     empty_parent_app = App()
+    log = empty_parent_app.log
 
-    # detect base classes
-    LoginHandler = empty_parent_app.login_handler_class
-    LogoutHandler = empty_parent_app.logout_handler_class
-    BaseHandler = getattr(empty_parent_app, "base_handler_class", None)
-    if BaseHandler is None:
-        pkg = detect_base_package(App)
-        if pkg == "jupyter_server":
-            BaseHandler = import_item("jupyter_server.base.handlers.JupyterHandler")
-        elif pkg == "notebook":
-            BaseHandler = import_item("notebook.base.handlers.IPythonHandler")
-        else:
-            raise ValueError(
-                "{}.base_handler_class must be defined".format(App.__name__)
-            )
+    # detect base handler classes
+    if not getattr(empty_parent_app, "login_handler_class", None) and hasattr(
+        empty_parent_app, "identity_provider_class"
+    ):
+        # Jupyter Server 2 moves the login handler classes to the identity provider
+        has_handlers = empty_parent_app.identity_provider_class(parent=empty_parent_app)
+    else:
+        # prior to Jupyter Server 2, the app itself had handler class config
+        has_handlers = empty_parent_app
+    LoginHandler = has_handlers.login_handler_class
+    LogoutHandler = has_handlers.logout_handler_class
+    BaseHandler = _patch_app_base_handlers(empty_parent_app)
 
     # create Handler classes from mixins + bases
+
     class JupyterHubLoginHandler(JupyterHubLoginHandlerMixin, LoginHandler):
         pass
 
@@ -725,6 +937,7 @@ def make_singleuser_app(App):
     merged_flags = {}
     merged_flags.update(empty_parent_app.flags or {})
     merged_flags.update(flags)
+
     # create mixed-in App class, bringing it all together
     class SingleUserNotebookApp(SingleUserNotebookAppMixin, App):
         aliases = merged_aliases
@@ -734,5 +947,12 @@ def make_singleuser_app(App):
         login_handler_class = JupyterHubLoginHandler
         logout_handler_class = JupyterHubLogoutHandler
         oauth_callback_handler_class = OAuthCallbackHandler
+
+        def initialize(self, *args, **kwargs):
+            result = super().initialize(*args, **kwargs)
+            # run patch again after initialize, so extensions have already been loaded
+            # probably a no-op most of the time
+            _patch_app_base_handlers(self)
+            return result
 
     return SingleUserNotebookApp
