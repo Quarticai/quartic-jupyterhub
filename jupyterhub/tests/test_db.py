@@ -26,7 +26,7 @@ def generate_old_db(env_dir, hub_version, db_url):
     env_pip = os.path.join(env_dir, 'bin', 'pip')
     env_py = os.path.join(env_dir, 'bin', 'python')
     check_call([sys.executable, '-m', 'virtualenv', env_dir])
-    pkgs = ['jupyterhub==' + hub_version]
+    pkgs = [f'jupyterhub=={hub_version}']
 
     # older jupyterhub needs older sqlachemy version
     if V(hub_version) < V("2"):
@@ -55,7 +55,9 @@ async def test_upgrade(tmpdir, hub_version):
 
     # use persistent temp env directory
     # to reuse across multiple runs
-    env_dir = os.path.join(tempfile.gettempdir(), 'test-hub-upgrade-%s' % hub_version)
+    env_dir = os.path.join(
+        tempfile.gettempdir(), f'test-hub-upgrade-{hub_version}'
+    )
 
     generate_old_db(env_dir, hub_version, db_url)
 

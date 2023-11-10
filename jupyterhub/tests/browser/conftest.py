@@ -8,7 +8,6 @@ async def browser():
     async with async_playwright() as playwright:
         browser = await playwright.firefox.launch(headless=True)
         context = await browser.new_context()
-        page = await context.new_page()
-        yield page
+        yield await context.new_page()
         await context.clear_cookies()
         await browser.close()

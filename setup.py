@@ -15,7 +15,7 @@ from setuptools.command.build_py import build_py
 from setuptools.command.sdist import sdist
 
 shell = False
-if os.name in ('nt', 'dos'):
+if os.name in {'nt', 'dos'}:
     shell = True
     warning = "WARNING: Windows is not officially supported"
     print(warning, file=sys.stderr)
@@ -49,15 +49,15 @@ def get_package_data():
 
     (mostly alembic config)
     """
-    package_data = {}
-    package_data['jupyterhub'] = [
-        'alembic.ini',
-        'alembic/*',
-        'alembic/versions/*',
-        'event-schemas/*/*.yaml',
-        'singleuser/templates/*.html',
-    ]
-    return package_data
+    return {
+        'jupyterhub': [
+            'alembic.ini',
+            'alembic/*',
+            'alembic/versions/*',
+            'event-schemas/*/*.yaml',
+            'singleuser/templates/*.html',
+        ]
+    }
 
 
 
@@ -226,7 +226,7 @@ class CSS(BaseCommand):
         # from IPython.html.tasks.py
 
         css_targets = [pjoin(static, 'css', 'style.min.css')]
-        css_maps = [t + '.map' for t in css_targets]
+        css_maps = [f'{t}.map' for t in css_targets]
         targets = css_targets + css_maps
         if not all(os.path.exists(t) for t in targets):
             # some generated files don't exist
@@ -254,7 +254,7 @@ class CSS(BaseCommand):
 
         style_less = pjoin(static, 'less', 'style.less')
         style_css = pjoin(static, 'css', 'style.min.css')
-        sourcemap = style_css + '.map'
+        sourcemap = f'{style_css}.map'
 
         args = [
             'npm',
@@ -271,7 +271,7 @@ class CSS(BaseCommand):
         try:
             check_call(args, cwd=here, shell=shell)
         except OSError as e:
-            print("Failed to run lessc: %s" % e, file=sys.stderr)
+            print(f"Failed to run lessc: {e}", file=sys.stderr)
             print("You can install js dependencies with `npm install`", file=sys.stderr)
             raise
         # update data-files in case this created new files
@@ -295,9 +295,7 @@ class JSX(BaseCommand):
 
         js_target_mtime = mtime(self.js_target)
         jsx_mtime = recursive_mtime(self.jsx_dir)
-        if js_target_mtime < jsx_mtime:
-            return True
-        return False
+        return js_target_mtime < jsx_mtime
 
     def run(self):
         if not self.should_run():
@@ -395,7 +393,7 @@ setup_args['cmdclass']['develop'] = develop_js_css
 setup_args['install_requires'] = install_requires = []
 
 with open('requirements.txt') as f:
-    for line in f.readlines():
+    for line in f:
         req = line.strip()
         if not req or req.startswith('#') or '://' in req:
             continue

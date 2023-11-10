@@ -261,8 +261,7 @@ class MockHub(JupyterHub):
     @default('port')
     def _port_default(self):
         if self.subdomain_host:
-            port = urlparse(self.subdomain_host).port
-            if port:
+            if port := urlparse(self.subdomain_host).port:
                 return port
         return random_port()
 
@@ -355,10 +354,8 @@ class MockHub(JupyterHub):
     async def login_user(self, name):
         """Login a user by name, returning her cookies."""
         base_url = public_url(self)
-        external_ca = None
-        if self.internal_ssl:
-            external_ca = self.external_certs['files']['ca']
-        login_url = base_url + 'hub/login'
+        external_ca = self.external_certs['files']['ca'] if self.internal_ssl else None
+        login_url = f'{base_url}hub/login'
         r = await async_requests.get(login_url)
         r.raise_for_status()
         xsrf = r.cookies['_xsrf']

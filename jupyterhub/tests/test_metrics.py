@@ -110,10 +110,7 @@ async def test_active_users(app):
         ]
     ):
         user = add_user(db, name=f"active-{i}")
-        if offset:
-            user.last_activity = now - offset
-        else:
-            user.last_activity = None
+        user.last_activity = now - offset if offset else None
         db.commit()
 
     # collect before update is called, don't include new users

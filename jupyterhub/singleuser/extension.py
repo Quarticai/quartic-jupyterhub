@@ -60,10 +60,7 @@ def _bool_env(key):
 
     0, empty, or unset is False; All other values are True.
     """
-    if os.environ.get(key, "") in {"", "0"}:
-        return False
-    else:
-        return True
+    return os.environ.get(key, "") not in {"", "0"}
 
 
 def _exclude_home(path_list):
@@ -375,8 +372,7 @@ class JupyterHubSingleUser(ExtensionApp):
 
     @default('hub_activity_interval')
     def _default_activity_interval(self):
-        env_value = os.environ.get('JUPYTERHUB_ACTIVITY_INTERVAL')
-        if env_value:
+        if env_value := os.environ.get('JUPYTERHUB_ACTIVITY_INTERVAL'):
             return int(env_value)
         else:
             return 300
@@ -483,9 +479,7 @@ class JupyterHubSingleUser(ExtensionApp):
         cfg.answer_yes = True
         self.config.FileContentsManager.delete_to_trash = False
 
-        # load Spawner.notebook_dir configuration, if given
-        root_dir = os.getenv("JUPYTERHUB_ROOT_DIR", None)
-        if root_dir:
+        if root_dir := os.getenv("JUPYTERHUB_ROOT_DIR", None):
             cfg.root_dir = os.path.expanduser(root_dir)
 
         # load http server config from environment
@@ -496,11 +490,7 @@ class JupyterHubSingleUser(ExtensionApp):
             cfg.port = 80
         elif url.scheme == 'https':
             cfg.port = 443
-        if url.hostname:
-            cfg.ip = url.hostname
-        else:
-            cfg.ip = "127.0.0.1"
-
+        cfg.ip = url.hostname if url.hostname else "127.0.0.1"
         cfg.base_url = os.environ.get('JUPYTERHUB_SERVICE_PREFIX') or '/'
 
         # load default_url at all kinds of priority,
@@ -545,9 +535,7 @@ class JupyterHubSingleUser(ExtensionApp):
             self.log.info(f"Using default url from user config: {default_url}")
             return default_url
 
-        # 2. explicit via JupyterHub admin config (c.Spawner.default_url)
-        default_url = os.environ.get("JUPYTERHUB_DEFAULT_URL")
-        if default_url:
+        if default_url := os.environ.get("JUPYTERHUB_DEFAULT_URL"):
             self.log.info(
                 f"Using default url from environment $JUPYTERHUB_DEFAULT_URL: {default_url}"
             )
@@ -623,7 +611,7 @@ class JupyterHubSingleUser(ExtensionApp):
             "page_config_hook"
         ] = app.identity_provider.page_config_hook
         # if the user has configured a log function in the tornado settings, do not override it
-        if not 'log_function' in app.config.ServerApp.get('tornado_settings', {}):
+        if 'log_function' not in app.config.ServerApp.get('tornado_settings', {}):
             app.web_app.settings["log_function"] = log_request
         # add jupyterhub version header
         headers = app.web_app.settings.setdefault("headers", {})

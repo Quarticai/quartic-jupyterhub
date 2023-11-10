@@ -317,11 +317,7 @@ def test_singleuser_app_class(JUPYTERHUB_SINGLEUSER_APP):
         # not specified, will try both
         expect_error = not (have_server or have_notebook)
 
-    if expect_error:
-        ctx = pytest.raises(CalledProcessError)
-    else:
-        ctx = nullcontext()
-
+    ctx = pytest.raises(CalledProcessError) if expect_error else nullcontext()
     with mock.patch.dict(
         os.environ,
         {
@@ -355,8 +351,5 @@ async def test_nbclassic_control_panel(app, user, full_spawn):
     page = BeautifulSoup(r.text, "html.parser")
     link = page.find("a", id="jupyterhub-control-panel-link")
     assert link, f"Missing jupyterhub-control-panel-link in {page}"
-    if app.subdomain_host:
-        prefix = public_url(app)
-    else:
-        prefix = app.base_url
+    prefix = public_url(app) if app.subdomain_host else app.base_url
     assert link["href"] == url_path_join(prefix, "hub/home")

@@ -74,7 +74,7 @@ def isoformat(dt):
         return None
     if dt.tzinfo:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt.isoformat() + 'Z'
+    return f'{dt.isoformat()}Z'
 
 
 def can_connect(ip, port):
@@ -401,7 +401,7 @@ def hash_token(token, salt=8, rounds=16384, algorithm='sha512'):
         bsalt = salt.encode('utf8')
     btoken = token.encode('utf8', 'replace')
     h.update(bsalt)
-    for i in range(rounds):
+    for _ in range(rounds):
         h.update(btoken)
     digest = h.hexdigest()
 
@@ -418,9 +418,7 @@ def compare_token(compare, token):
         token, salt=salt, rounds=int(srounds), algorithm=algorithm
     ).encode('utf8')
     compare = compare.encode('utf8')
-    if compare_digest(compare, hashed):
-        return True
-    return False
+    return bool(compare_digest(compare, hashed))
 
 
 def url_escape_path(value):
@@ -442,9 +440,9 @@ def url_path_join(*pieces):
     result = '/'.join(s for s in stripped if s)
 
     if initial:
-        result = '/' + result
+        result = f'/{result}'
     if final:
-        result = result + '/'
+        result += '/'
     if result == '//':
         result = '/'
 
@@ -468,11 +466,7 @@ def print_ps_info(file=sys.stderr):
     p = psutil.Process()
     # format CPU percentage
     cpu = p.cpu_percent(0.1)
-    if cpu >= 10:
-        cpu_s = "%i" % cpu
-    else:
-        cpu_s = "%.1f" % cpu
-
+    cpu_s = "%i" % cpu if cpu >= 10 else "%.1f" % cpu
     # format memory (only resident set)
     rss = p.memory_info().rss
     if rss >= 1e9:
@@ -492,19 +486,12 @@ def print_ps_info(file=sys.stderr):
     threadlen = len('threads')
 
     print(
-        "%s %s %s %s"
-        % ('%CPU'.ljust(cpulen), 'MEM'.ljust(memlen), 'FDs'.ljust(fdlen), 'threads'),
+        f"{'%CPU'.ljust(cpulen)} {'MEM'.ljust(memlen)} {'FDs'.ljust(fdlen)} threads",
         file=file,
     )
 
     print(
-        "%s %s %s %s"
-        % (
-            cpu_s.ljust(cpulen),
-            mem_s.ljust(memlen),
-            fd_s.ljust(fdlen),
-            str(p.num_threads()).ljust(7),
-        ),
+        f"{cpu_s.ljust(cpulen)} {mem_s.ljust(memlen)} {fd_s.ljust(fdlen)} {str(p.num_threads()).ljust(7)}",
         file=file,
     )
 
@@ -534,7 +521,7 @@ def print_stacks(file=sys.stderr):
 
     print("Active threads: %i" % threading.active_count(), file=file)
     for thread in threading.enumerate():
-        print("Thread %s:" % thread.name, end='', file=file)
+        print(f"Thread {thread.name}:", end='', file=file)
         frame = sys._current_frames()[thread.ident]
         stack = traceback.extract_stack(frame)
         if thread is threading.current_thread():
@@ -559,11 +546,7 @@ def print_stacks(file=sys.stderr):
 
         print(''.join(['\n'] + traceback.format_list(stack)), file=file)
 
-    # also show asyncio tasks, if any
-    # this will increase over time as we transition from tornado
-    # coroutines to native `async def`
-    tasks = asyncio_all_tasks()
-    if tasks:
+    if tasks := asyncio_all_tasks():
         print("AsyncIO tasks: %i" % len(tasks))
         for task in tasks:
             task.print_stack(file=file)
@@ -711,15 +694,14 @@ def get_accepted_mimetype(accept_header, choices=None):
     Return `None` if choices is given and no match is found,
     or nothing is specified.
     """
-    for mime, params, q in _parse_accept_header(accept_header):
-        if choices:
-            if mime in choices:
-                return mime
-            else:
-                continue
-        else:
-            return mime
-    return None
+    return next(
+        (
+            mime
+            for mime, params, q in _parse_accept_header(accept_header)
+            if choices and mime in choices or not choices
+        ),
+        None,
+    )
 
 
 def catch_db_error(f):
@@ -754,9 +736,7 @@ def get_browser_protocol(request):
     so trusting possible spoofs is the right thing to do.
     """
     headers = request.headers
-    # first choice: Forwarded header
-    forwarded_header = headers.get("Forwarded")
-    if forwarded_header:
+    if forwarded_header := headers.get("Forwarded"):
         first_forwarded = forwarded_header.split(",", 1)[0].strip()
         fields = {}
         forwarded_dict = {}
@@ -770,9 +750,9 @@ def get_browser_protocol(request):
                 f"Forwarded header present without protocol: {forwarded_header}"
             )
 
-    # second choice: X-Scheme or X-Forwarded-Proto
-    proto_header = headers.get("X-Scheme", headers.get("X-Forwarded-Proto", None))
-    if proto_header:
+    if proto_header := headers.get(
+        "X-Scheme", headers.get("X-Forwarded-Proto", None)
+    ):
         proto_header = proto_header.split(",")[0].strip().lower()
         if proto_header in {"http", "https"}:
             return proto_header

@@ -141,9 +141,7 @@ class APIHandler(BaseHandler):
             except Exception:
                 pass
 
-            # construct the custom reason, if defined
-            reason = getattr(exception, 'reason', '')
-            if reason:
+            if reason := getattr(exception, 'reason', ''):
                 status_message = reason
 
         if exception and isinstance(exception, SQLAlchemyError):
@@ -160,10 +158,7 @@ class APIHandler(BaseHandler):
 
         self.set_header('Content-Type', 'application/json')
         if isinstance(exception, web.HTTPError):
-            # allow setting headers from exceptions
-            # since exception handler clears headers
-            headers = getattr(exception, 'headers', None)
-            if headers:
+            if headers := getattr(exception, 'headers', None):
                 for key, value in headers.items():
                     self.set_header(key, value)
             # Content-Length must be recalculated.
@@ -224,7 +219,7 @@ class APIHandler(BaseHandler):
             owner_key = 'service'
             owner = token.service.name
 
-        model = {
+        return {
             owner_key: owner,
             'id': token.api_id,
             'kind': 'api_token',
@@ -239,7 +234,6 @@ class APIHandler(BaseHandler):
             'oauth_client': token.oauth_client.description
             or token.oauth_client.identifier,
         }
-        return model
 
     def _filter_model(self, model, access_map, entity, kind, keys=None):
         """
@@ -311,16 +305,13 @@ class APIHandler(BaseHandler):
             if '' in user.spawners and 'pending' in allowed_keys:
                 model['pending'] = user.spawners[''].pending
 
-            servers = {}
             scope_filter = self.get_scope_filter('read:servers')
-            for name, spawner in user.spawners.items():
-                # include 'active' servers, not just ready
-                # (this includes pending events)
-                if (spawner.active or include_stopped_servers) and scope_filter(
-                    spawner, kind='server'
-                ):
-                    servers[name] = self.server_model(spawner)
-
+            servers = {
+                name: self.server_model(spawner)
+                for name, spawner in user.spawners.items()
+                if (spawner.active or include_stopped_servers)
+                and scope_filter(spawner, kind='server')
+            }
             if include_stopped_servers:
                 # add any stopped servers in the db
                 seen = set(servers.keys())
@@ -446,10 +437,8 @@ class APIHandler(BaseHandler):
         try:
             offset = abs(int(offset)) if offset is not None else 0
             limit = abs(int(limit))
-            if limit > max_limit:
-                limit = max_limit
-            if limit < 1:
-                limit = 1
+            limit = min(limit, max_limit)
+            limit = max(limit, 1)
         except Exception as e:
             raise web.HTTPError(
                 400, "Invalid argument type, offset and limit must be integers"

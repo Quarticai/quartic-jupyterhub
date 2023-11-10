@@ -21,10 +21,7 @@ class JupyterHubTestHandler(JupyterHandler):
             if obj is None:
                 return None
 
-            if obj.__class__ is type:
-                cls = obj
-            else:
-                cls = obj.__class__
+            cls = obj if obj.__class__ is type else obj.__class__
             return f"{cls.__module__}.{cls.__name__}"
 
         info = {
@@ -48,7 +45,7 @@ def _load_jupyter_server_extension(serverapp):
     serverapp.log.warning(f"Loading jupyterhub test extension for {serverapp}")
     handlers = [
         (
-            serverapp.base_url + 'jupyterhub-test-info',
+            f'{serverapp.base_url}jupyterhub-test-info',
             JupyterHubTestHandler,
             {"app": serverapp},
         )

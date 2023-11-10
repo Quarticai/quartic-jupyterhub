@@ -8,6 +8,7 @@
     Default app changed to launch `jupyter labhub`.
     Use JUPYTERHUB_SINGLEUSER_APP='notebook' for the legacy 'classic' notebook server (requires notebook<7).
 """
+
 import os
 
 from traitlets import import_item
@@ -23,12 +24,9 @@ _app_shortcuts = {
     "extension": "jupyter_server.serverapp.ServerApp",
 }
 
-JUPYTERHUB_SINGLEUSER_APP = _app_shortcuts.get(
+if JUPYTERHUB_SINGLEUSER_APP := _app_shortcuts.get(
     JUPYTERHUB_SINGLEUSER_APP.replace("_", "-"), JUPYTERHUB_SINGLEUSER_APP
-)
-
-
-if JUPYTERHUB_SINGLEUSER_APP:
+):
     if JUPYTERHUB_SINGLEUSER_APP in {"notebook", _app_shortcuts["notebook"]}:
         # better error for notebook v7, which uses jupyter-server
         # when the legacy notebook server is requested

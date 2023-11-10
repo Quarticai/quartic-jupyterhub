@@ -106,7 +106,7 @@ async def test_open_url_login(
     # verify title / url
     await expect(browser).to_have_title("JupyterHub")
     f_string = re.escape(f"{form_action}")
-    await expect(form).to_have_attribute('action', re.compile('.*' + f_string))
+    await expect(form).to_have_attribute('action', re.compile(f'.*{f_string}'))
 
     # login in with params
     await login(browser, user.name, password=user.name)
@@ -115,11 +115,11 @@ async def test_open_url_login(
         await expect(browser).to_have_url(re.compile(".*param=value"))
     elif "next=%2Fhub" in form_action:
         escaped_string = re.escape('spawn?param=value')
-        pattern = re.compile('.*' + escaped_string)
+        pattern = re.compile(f'.*{escaped_string}')
         await expect(browser).to_have_url(re.compile(pattern))
         await expect(browser).not_to_have_url(re.compile(".*/user/.*"))
     else:
-        await expect(browser).to_have_url(re.compile(".*/user/" + f"{user.name}/"))
+        await expect(browser).to_have_url(re.compile(f".*/user/{user.name}/"))
 
 
 @pytest.mark.parametrize(
@@ -157,7 +157,7 @@ async def open_spawn_pending(app, browser, user):
     await browser.goto(url)
     await login(browser, user.name, password=user.name)
     url_spawn = url_path_join(
-        public_host(app), app.hub.base_url, '/spawn-pending/' + user.name
+        public_host(app), app.hub.base_url, f'/spawn-pending/{user.name}'
     )
     await browser.goto(url_spawn)
     await expect(browser).to_have_url(url_spawn)
@@ -181,7 +181,7 @@ async def test_spawn_pending_server_not_started(
     await expect(launch_btn).to_be_enabled()
     await expect(launch_btn).to_have_count(1)
     f_string = re.escape(f"/hub/spawn/{user.name}")
-    await expect(launch_btn).to_have_attribute('href', re.compile('.*' + f_string))
+    await expect(launch_btn).to_have_attribute('href', re.compile(f'.*{f_string}'))
 
 
 async def test_spawn_pending_progress(app, browser, no_patience, user, slow_spawn):
@@ -196,14 +196,12 @@ async def test_spawn_pending_progress(app, browser, no_patience, user, slow_spaw
     await expect(launch_btn).to_be_enabled()
 
     # begin starting the server
-    async with browser.expect_navigation(
-        url=re.compile(".*/spawn-pending/" + f"{user.name}")
-    ):
+    async with browser.expect_navigation(url=re.compile(f".*/spawn-pending/{user.name}")):
         await launch_btn.click()
     # wait for progress message to appear
     progress = browser.locator("#progress-message")
     progress_message = await progress.inner_text()
-    async with browser.expect_navigation(url=re.compile(".*/user/" + f"{user.name}/")):
+    async with browser.expect_navigation(url=re.compile(f".*/user/{user.name}/")):
         # wait for log messages to appear
         expected_messages = [
             "Server requested",
@@ -222,7 +220,7 @@ async def test_spawn_pending_progress(app, browser, no_patience, user, slow_spaw
             if logs_list:
                 assert progress_message
             assert logs_list == expected_messages[: len(logs_list)]
-    await expect(browser).to_have_url(re.compile(".*/user/" + f"{user.name}/"))
+    await expect(browser).to_have_url(re.compile(f".*/user/{user.name}/"))
     assert user.spawner.ready
 
 
@@ -254,8 +252,10 @@ async def test_spawn_pending_server_ready(app, browser, user):
 async def open_home_page(app, browser, user):
     """function to open the home page"""
 
-    home_page = url_escape(app.base_url) + "hub/home"
-    url = url_path_join(public_host(app), app.hub.base_url, "/login?next=" + home_page)
+    home_page = f"{url_escape(app.base_url)}hub/home"
+    url = url_path_join(
+        public_host(app), app.hub.base_url, f"/login?next={home_page}"
+    )
     await browser.goto(url)
     await login(browser, user.name, password=str(user.name))
     await expect(browser).to_have_url(re.compile(".*/hub/home"))
@@ -274,8 +274,10 @@ async def test_start_button_server_not_started(app, browser, user):
     await expect(start_stop_btns).to_have_count(1)
     await expect(start_stop_btns).to_have_text(expected_btn_name)
     f_string = re.escape(f"/hub/spawn/{user.name}")
-    await expect(start_stop_btns).to_have_attribute('href', re.compile('.*' + f_string))
-    async with browser.expect_navigation(url=re.compile(".*/user/" + f"{user.name}/")):
+    await expect(start_stop_btns).to_have_attribute(
+        'href', re.compile(f'.*{f_string}')
+    )
+    async with browser.expect_navigation(url=re.compile(f".*/user/{user.name}/")):
         # Start server via clicking on the Start button
         await start_stop_btns.click()
     # return to Home page
@@ -291,7 +293,7 @@ async def test_start_button_server_not_started(app, browser, user):
     ]
     f_string = re.escape(f"/user/{user.name}")
     await expect(start_stop_btns.nth(1)).to_have_attribute(
-        'href', re.compile('.*' + f_string)
+        'href', re.compile(f'.*{f_string}')
     )
     await expect(start_stop_btns.nth(0)).to_have_id("stop")
     await expect(start_stop_btns.nth(1)).to_have_id("start")
@@ -306,7 +308,7 @@ async def test_stop_button(app, browser, user):
     start_stop_btns = browser.locator('//div[@class="text-center"]').get_by_role(
         "button"
     )
-    async with browser.expect_navigation(url=re.compile(".*/user/" + f"{user.name}/")):
+    async with browser.expect_navigation(url=re.compile(f".*/user/{user.name}/")):
         # Start server via clicking on the Start button
         await start_stop_btns.click()
     assert user.spawner.ready
@@ -317,7 +319,9 @@ async def test_stop_button(app, browser, user):
     await start_stop_btns.nth(0).click()
     await expect(start_stop_btns).to_have_count(1)
     f_string = re.escape(f"/hub/spawn/{user.name}")
-    await expect(start_stop_btns).to_have_attribute('href', re.compile('.*' + f_string))
+    await expect(start_stop_btns).to_have_attribute(
+        'href', re.compile(f'.*{f_string}')
+    )
     expected_btn_name = "Start My Server"
     await expect(start_stop_btns).to_have_text(expected_btn_name)
     await expect(start_stop_btns).to_have_id("start")
@@ -329,8 +333,10 @@ async def test_stop_button(app, browser, user):
 async def open_token_page(app, browser, user):
     """function to open the token page"""
 
-    token_page = url_escape(app.base_url) + "hub/token"
-    url = url_path_join(public_host(app), app.hub.base_url, "/login?next=" + token_page)
+    token_page = f"{url_escape(app.base_url)}hub/token"
+    url = url_path_join(
+        public_host(app), app.hub.base_url, f"/login?next={token_page}"
+    )
     await browser.goto(url)
     await login(browser, user.name, password=str(user.name))
     await expect(browser).to_have_url(re.compile(".*/hub/token"))
@@ -439,7 +445,7 @@ async def test_request_token_expiration(app, browser, token_opt, note, user):
     orm_token = user.api_tokens[-1]
 
     if token_opt == "server_up":
-        expected_note = "Server at " + ujoin(app.base_url, f"/user/{user.name}/")
+        expected_note = f'Server at {ujoin(app.base_url, f"/user/{user.name}/")}'
     elif note:
         expected_note = note
     else:
@@ -466,7 +472,13 @@ async def test_request_token_expiration(app, browser, token_opt, note, user):
     )
     assert last_used_text == "Never"
 
-    if token_opt == "Never":
+    if (
+        token_opt == "Never"
+        or token_opt != "1 Hour"
+        and token_opt != "1 Day"
+        and token_opt != "1 Week"
+        and token_opt == "server_up"
+    ):
         assert orm_token.expires_at is None
         assert expires_at_text == "Never"
     elif token_opt == "1 Hour":
@@ -475,9 +487,6 @@ async def test_request_token_expiration(app, browser, token_opt, note, user):
         assert expires_at_text == "in a day"
     elif token_opt == "1 Week":
         assert expires_at_text == "in 7 days"
-    elif token_opt == "server_up":
-        assert orm_token.expires_at is None
-        assert expires_at_text == "Never"
     # verify that the button for revoke is presented
     revoke_btn = (
         api_token_table_area.locator("tr.token-row")
@@ -502,7 +511,7 @@ async def test_revoke_token(app, browser, token_type, user):
 
     # open the home page
     await open_home_page(app, browser, user)
-    if token_type == "server_up" or token_type == "both":
+    if token_type in ["server_up", "both"]:
         # Start server via clicking on the Start button
         async with browser.expect_navigation(url=f"**/user/{user.name}/"):
             await browser.locator("#start").click()
@@ -510,7 +519,7 @@ async def test_revoke_token(app, browser, token_type, user):
     next_url = url_path_join(public_host(app), app.base_url, '/hub/token')
     await browser.goto(next_url)
     await expect(browser).to_have_url(re.compile(".*/hub/token"))
-    if token_type == "both" or token_type == "request_by_user":
+    if token_type in ["both", "request_by_user"]:
         request_btn = browser.locator('//div[@class="text-center"]').get_by_role(
             "button"
         )
@@ -588,7 +597,7 @@ async def test_menu_bar(app, browser, page, logged_in, user):
         # verify that links on the topbar work, checking the titles of links
         link = bar_link_elements.nth(index)
         await expect(bar_link_elements.nth(index)).to_have_attribute(
-            'href', re.compile('.*' + expected_link_bar_url[index])
+            'href', re.compile(f'.*{expected_link_bar_url[index]}')
         )
         await expect(bar_link_elements.nth(index)).to_have_text(
             expected_link_bar_name[index]
@@ -601,12 +610,12 @@ async def test_menu_bar(app, browser, page, logged_in, user):
             else:
                 await expect(browser).to_have_url(re.compile(f".*/user/{user.name}/"))
                 await browser.go_back()
-                await expect(browser).to_have_url(re.compile(".*" + page))
+                await expect(browser).to_have_url(re.compile(f".*{page}"))
         elif index == 3:
             await expect(browser).to_have_url(re.compile(".*/login"))
         else:
             await expect(browser).to_have_url(
-                re.compile(".*" + expected_link_bar_url[index])
+                re.compile(f".*{expected_link_bar_url[index]}")
             )
 
 
@@ -618,9 +627,7 @@ async def test_menu_bar(app, browser, page, logged_in, user):
     [("/hub/home"), ("/hub/token"), ("/hub/spawn")],
 )
 async def test_user_logout(app, browser, url, user):
-    if "/hub/home" in url:
-        await open_home_page(app, browser, user)
-    elif "/hub/token" in url:
+    if "/hub/home" in url or "/hub/token" in url:
         await open_home_page(app, browser, user)
     elif "/hub/spawn" in url:
         await open_spawn_pending(app, browser, user)
@@ -637,7 +644,7 @@ async def test_user_logout(app, browser, url, user):
 
     # verify that user can login after logout
     await login(browser, user.name, password=user.name)
-    await expect(browser).to_have_url(re.compile(".*/user/" + f"{user.name}/"))
+    await expect(browser).to_have_url(re.compile(f".*/user/{user.name}/"))
 
 
 # OAUTH confirmation page
@@ -688,11 +695,11 @@ async def test_oauth_page(
     oauth_client.allowed_scopes = sorted(roles.roles_to_scopes([service_role]))
     app.db.commit()
     # open the service url in the browser
-    service_url = url_path_join(public_url(app, service) + 'owhoami/?arg=x')
+    service_url = url_path_join(f'{public_url(app, service)}owhoami/?arg=x')
     await browser.goto(service_url)
 
     expected_redirect_url = url_path_join(
-        app.base_url + f"services/{service.name}/oauth_callback"
+        f"{app.base_url}services/{service.name}/oauth_callback"
     )
     expected_client_id = f"service-{service.name}"
 
@@ -781,23 +788,23 @@ async def test_oauth_page(
 
 async def open_admin_page(app, browser, login_as=None):
     """Login as `user` and open the admin page"""
-    admin_page = url_escape(app.base_url) + "hub/admin"
+    admin_page = f"{url_escape(app.base_url)}hub/admin"
     if login_as:
         user = login_as
         url = url_path_join(
-            public_host(app), app.hub.base_url, "/login?next=" + admin_page
+            public_host(app), app.hub.base_url, f"/login?next={admin_page}"
         )
         await browser.goto(url)
         await login(browser, user.name, password=str(user.name))
-        await expect(browser).to_have_url(re.compile(".*/hub/admin"))
     else:
         # url = url_path_join(public_host(app), app.hub.base_url, "/login?next=" + admin_page)
         await browser.goto(admin_page)
-        await expect(browser).to_have_url(re.compile(".*/hub/admin"))
+
+    await expect(browser).to_have_url(re.compile(".*/hub/admin"))
 
 
 def create_list_of_users(create_user_with_scopes, n):
-    return [create_user_with_scopes("self") for i in range(n)]
+    return [create_user_with_scopes("self") for _ in range(n)]
 
 
 async def test_start_stop_all_servers_on_admin_page(app, browser, admin_user):
@@ -890,16 +897,14 @@ async def test_paging_on_admin_page(
     btn_next = browser.get_by_role("button", name="Next")
     # verify "Previous"/"Next" button clickability depending on users number on the page
     await expect(displaying).to_have_text(
-        re.compile(".*" + f"0-{min(users_count_db,50)}" + ".*")
+        re.compile(f".*0-{min(users_count_db, 50)}.*")
     )
     if users_count_db > 50:
         await expect(btn_next.locator("//span")).to_have_class("active-pagination")
         # click on Next button
         await btn_next.click()
         if users_count_db <= 100:
-            await expect(displaying).to_have_text(
-                re.compile(".*" + f"50-{users_count_db}" + ".*")
-            )
+            await expect(displaying).to_have_text(re.compile(f".*50-{users_count_db}.*"))
         else:
             await expect(displaying).to_have_text(re.compile(".*" + "50-100" + ".*"))
             await expect(btn_next.locator("//span")).to_have_class("active-pagination")
@@ -1012,7 +1017,7 @@ async def test_start_stop_server_on_admin_page(
     users = await browser.locator('//td[@data-testid="user-row-name"]').all()
     users_list = [await user.text_content() for user in users]
     users_list = [user.strip() for user in users_list]
-    assert {user1.name, user2.name}.issubset({e for e in users_list})
+    assert {user1.name, user2.name}.issubset(set(users_list))
 
     # check that all users have correct link for Spawn Page
     spawn_page_btns = browser.locator(
@@ -1037,7 +1042,7 @@ async def test_start_stop_server_on_admin_page(
 
     # click on Spawn page button
     await click_spawn_page(browser, user2.name)
-    await expect(browser).to_have_url(re.compile(".*" + f"/user/{user2.name}/"))
+    await expect(browser).to_have_url(re.compile(f".*/user/{user2.name}/"))
 
     # open/return to the Admin page
     admin_page = url_path_join(public_host(app), app.hub.base_url, "admin")

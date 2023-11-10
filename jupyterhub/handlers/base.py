@@ -201,7 +201,7 @@ class BaseHandler(RequestHandler):
         Can be overridden by defining Content-Security-Policy in settings['headers']
         """
         return '; '.join(
-            ["frame-ancestors 'self'", "report-uri " + self.csp_report_uri]
+            ["frame-ancestors 'self'", f"report-uri {self.csp_report_uri}"]
         )
 
     def get_content_type(self):
@@ -276,9 +276,7 @@ class BaseHandler(RequestHandler):
         """Get the authorization token from Authorization header"""
         auth_header = self.request.headers.get('Authorization', '')
         match = auth_header_pat.match(auth_header)
-        if not match:
-            return None
-        return match.group(1)
+        return None if not match else match.group(1)
 
     def _record_activity(self, obj, timestamp=None):
         """record activity on an ORM object
@@ -370,10 +368,7 @@ class BaseHandler(RequestHandler):
     def get_token(self):
         """get token from authorization header"""
         token = self.get_auth_token()
-        if token is None:
-            return None
-        orm_token = orm.APIToken.find(self.db, token)
-        return orm_token
+        return None if token is None else orm.APIToken.find(self.db, token)
 
     def get_current_user_token(self):
         """get_current_user from Authorization header token"""
@@ -460,8 +455,7 @@ class BaseHandler(RequestHandler):
     def _resolve_roles_and_scopes(self):
         self.expanded_scopes = set()
         if self.current_user:
-            orm_token = self.get_token()
-            if orm_token:
+            if orm_token := self.get_token():
                 self.expanded_scopes = scopes.get_scopes_for(orm_token)
             else:
                 self.expanded_scopes = scopes.get_scopes_for(self.current_user)
@@ -521,8 +515,7 @@ class BaseHandler(RequestHandler):
         if self.subdomain_host:
             kwargs['domain'] = self.domain
         user = self.get_current_user_cookie()
-        session_id = self.get_session_cookie()
-        if session_id:
+        if session_id := self.get_session_cookie():
             # clear session id
             self.clear_cookie(SESSION_COOKIE_NAME, path=self.base_url, **kwargs)
 
@@ -661,25 +654,26 @@ class BaseHandler(RequestHandler):
             next_url = "//" + next_url.lstrip("/")
         parsed_next_url = urlparse(next_url)
 
-        if (next_url + '/').startswith(
-            (
-                f'{proto}://{host}/',
-                f'//{host}/',
+        if (
+            f'{next_url}/'.startswith(
+                (
+                    f'{proto}://{host}/',
+                    f'//{host}/',
+                )
             )
-        ) or (
-            self.subdomain_host
+            or self.subdomain_host
             and parsed_next_url.netloc
-            and ("." + parsed_next_url.netloc).endswith(
-                "." + urlparse(self.subdomain_host).netloc
+            and f".{parsed_next_url.netloc}".endswith(
+                f".{urlparse(self.subdomain_host).netloc}"
             )
         ):
             # treat absolute URLs for our host as absolute paths:
             # below, redirects that aren't strictly paths are rejected
             next_url = parsed_next_url.path
             if parsed_next_url.query:
-                next_url = next_url + '?' + parsed_next_url.query
+                next_url = f'{next_url}?{parsed_next_url.query}'
             if parsed_next_url.fragment:
-                next_url = next_url + '#' + parsed_next_url.fragment
+                next_url = f'{next_url}#{parsed_next_url.fragment}'
             parsed_next_url = urlparse(next_url)
 
         # if it still has host info, it didn't match our above check for *this* host
@@ -705,12 +699,10 @@ class BaseHandler(RequestHandler):
             # custom default URL, usually passed because user landed on that page but was not logged in
             if default:
                 next_url = default
+            elif callable(self.default_url):
+                next_url = self.default_url(self)
             else:
-                # As set in jupyterhub_config.py
-                if callable(self.default_url):
-                    next_url = self.default_url(self)
-                else:
-                    next_url = self.default_url
+                next_url = self.default_url
 
         if not next_url:
             # default URL after login
@@ -755,12 +747,11 @@ class BaseHandler(RequestHandler):
         if exclude is None:
             exclude = ['next']
         if self.request.query:
-            query_string = [
+            if query_string := [
                 param
                 for param in parse_qsl(self.request.query)
                 if param[0] not in exclude
-            ]
-            if query_string:
+            ]:
                 url = url_concat(url, query_string)
         return url
 
@@ -1102,8 +1093,7 @@ class BaseHandler(RequestHandler):
 
                 raise web.HTTPError(
                     500,
-                    "Spawner failed to start [status=%s]. The logs for %s may contain details."
-                    % (status, spawner._log_name),
+                    f"Spawner failed to start [status={status}]. The logs for {spawner._log_name} may contain details.",
                 )
 
             if spawner._waiting_for_response:
@@ -1321,9 +1311,7 @@ class BaseHandler(RequestHandler):
             except Exception:
                 pass
 
-            # construct the custom reason, if defined
-            reason = getattr(exception, 'reason', '')
-            if reason:
+            if reason := getattr(exception, 'reason', ''):
                 message = reasons.get(reason, reason)
 
         if exception and isinstance(exception, SQLAlchemyError):
@@ -1341,10 +1329,7 @@ class BaseHandler(RequestHandler):
 
         self.set_header('Content-Type', 'text/html')
         if isinstance(exception, web.HTTPError):
-            # allow setting headers from exceptions
-            # since exception handler clears headers
-            headers = getattr(exception, 'headers', None)
-            if headers:
+            if headers := getattr(exception, 'headers', None):
                 for key, value in headers.items():
                     self.set_header(key, value)
             # Content-Length must be recalculated.
@@ -1354,7 +1339,7 @@ class BaseHandler(RequestHandler):
         # so we run it sync here, instead of making a sync version of render_template
 
         try:
-            html = self.render_template('%s.html' % status_code, sync=True, **ns)
+            html = self.render_template(f'{status_code}.html', sync=True, **ns)
         except TemplateNotFound:
             self.log.debug("No template for %d", status_code)
             try:
@@ -1452,10 +1437,7 @@ class UserUrlHandler(BaseHandler):
         self.write(
             json.dumps(
                 {
-                    "message": (
-                        "JupyterHub server no longer running at {}."
-                        " Restart the server at {}"
-                    ).format(self.request.path[len(self.hub.base_url) - 1 :], spawn_url)
+                    "message": f"JupyterHub server no longer running at {self.request.path[len(self.hub.base_url) - 1:]}. Restart the server at {spawn_url}"
                 }
             )
         )
